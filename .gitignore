@@ -1,0 +1,5 @@
+paper
+paper.tar.gz
+*.epub
+.claude
+__pycache__

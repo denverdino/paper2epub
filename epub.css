@@ -1,0 +1,132 @@
+body {
+  font-family: "Noto Serif", "Georgia", serif;
+  color: #292929;
+  line-height: 1.5;
+  text-rendering: optimizeLegibility;
+  margin: 0;
+  padding: 0 1em;
+}
+
+p {
+  text-align: justify;
+  text-justify: inter-word;
+  hyphens: auto;
+  line-height: 1.5;
+  margin-bottom: 1.5em;
+  text-indent: 0;
+}
+
+h1 {
+  font-family: "Noto Sans", "Helvetica Neue", sans-serif;
+  font-weight: normal;
+  font-size: 1.7em;
+  text-align: center;
+  margin-top: 1em;
+  margin-bottom: 1.5em;
+}
+
+h2 {
+  font-family: "Noto Sans", "Helvetica Neue", sans-serif;
+  font-size: 1.4em;
+  font-weight: bold;
+  margin-bottom: 1.5em;
+}
+
+h3 {
+  font-family: "Noto Sans", "Helvetica Neue", sans-serif;
+  font-size: 1.15em;
+  font-weight: bold;
+  margin-bottom: 1em;
+}
+
+h4, h5, h6 {
+  font-family: "Noto Sans", "Helvetica Neue", sans-serif;
+  font-size: 1em;
+  font-weight: bold;
+  margin-bottom: 0.75em;
+}
+
+figure {
+  display: block;
+  text-align: center;
+  margin: 2em auto;
+  page-break-inside: avoid;
+}
+
+figure img, img {
+  max-width: 100%;
+  height: auto;
+}
+
+figcaption {
+  font-family: "Noto Serif", "Georgia", serif;
+  text-align: justify;
+  line-height: 1.5;
+  margin-top: 1em;
+  margin-bottom: 1em;
+  font-size: 0.9em;
+}
+
+table {
+  text-align: center;
+  margin: 2em auto;
+  border-collapse: collapse;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+caption {
+  text-align: justify;
+  line-height: 1.5;
+  margin-top: 1em;
+  margin-bottom: 1em;
+  font-size: 0.9em;
+}
+
+th, td {
+  padding: 0.3em 0.6em;
+}
+
+code, pre {
+  font-family: "Noto Sans Mono", "Courier New", monospace;
+  font-size: 0.9em;
+}
+
+pre {
+  overflow-x: auto;
+  padding: 0.5em;
+  line-height: 1.4;
+}
+
+a {
+  color: #1b7cac;
+  text-decoration: underline;
+  text-decoration-skip-ink: auto;
+}
+
+blockquote {
+  margin: 1em 2em;
+  font-style: italic;
+}
+
+math, .math {
+  white-space: nowrap;
+}
+
+sup {
+  line-height: 0;
+}
+
+.algorithmdisplay {
+  border: 1px solid #999;
+  padding: 0.8em 1em;
+  margin: 1.5em 0;
+  page-break-inside: avoid;
+}
+
+.algorithmdisplay p {
+  text-indent: 0;
+  margin-bottom: 0.3em;
+  line-height: 1.4;
+  text-align: left;
+}
