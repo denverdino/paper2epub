@@ -45,6 +45,14 @@ Check if the user wants a Chinese translation. Look for keywords like "翻译", 
 - If translation is requested, ensure `DASHSCOPE_API_KEY` is set. If not, ask the user for it.
 - If not mentioned, default to English-only.
 
+## Determine Email Mode
+
+Check if the user wants the EPUB sent via email. Look for keywords like "邮件", "发送", "email", "send", or "mail".
+
+- If email is requested, ensure `EMAIL_FROM`, `EMAIL_TO`, and `EMAIL_PASSWORD` are set. If not, ask the user for them.
+- SMTP defaults to Gmail (`smtp.gmail.com:465`). User can override with `SMTP_SSL_HOST` and `SMTP_SSL_PORT`.
+- Gmail users with 2FA enabled need an App Password (not their regular password).
+
 ## Run the Conversion
 
 Execute from the project directory:
@@ -56,6 +64,20 @@ For bilingual (English + Chinese) output:
 ```bash
 DASHSCOPE_API_KEY=<key> uv run paper2epub.py <arxiv-id> --translate
 ```
+
+To send the EPUB via email after conversion:
+```bash
+EMAIL_FROM=<from> EMAIL_TO=<to> EMAIL_PASSWORD=<password> uv run paper2epub.py <arxiv-id> --email
+```
+
+With custom SMTP server:
+```bash
+EMAIL_FROM=<from> EMAIL_TO=<to> EMAIL_PASSWORD=<password> \
+  SMTP_SSL_HOST=smtp.example.com SMTP_SSL_PORT=465 \
+  uv run paper2epub.py <arxiv-id> --email
+```
+
+Flags can be combined: `--translate --email`.
 
 The script downloads LaTeX source from arxiv.org, converts PDF figures to PNG, resolves cross-references, preprocesses algorithm environments, and runs pandoc to produce EPUB3 with MathML math rendering. With `--translate`, it uses Qwen3.6-Flash to produce a bilingual EPUB with English and Chinese paragraphs interleaved.
 
@@ -78,3 +100,5 @@ Report the file path and size to the user. A typical paper produces a 0.5–2 MB
 - **pypdfium2 warning**: Non-fatal — some PDF figures may fail to convert but the EPUB will still generate.
 - **Translation failure**: Individual paragraph translation failures are non-fatal — untranslated paragraphs will remain English-only. Report any warnings to the user.
 - **Missing DASHSCOPE_API_KEY**: If `--translate` is used without setting the environment variable, the script will exit with an error. Ask the user for the key.
+- **Email send failure**: SMTP authentication errors usually mean wrong password or Gmail needs an App Password. Connection errors may indicate wrong host/port or firewall blocking.
+- **Missing email env vars**: If `--email` is used without `EMAIL_FROM`, `EMAIL_TO`, or `EMAIL_PASSWORD`, the script will exit with an error listing the missing variables.

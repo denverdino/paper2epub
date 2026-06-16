@@ -12,10 +12,12 @@ import argparse
 import os
 import re
 import shutil
+import smtplib
 import subprocess
 import sys
 import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.message import EmailMessage
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,7 +33,13 @@ ALGO_CMDS = re.compile(
 NEEDS_BRACE_ARG = {"For", "ForAll", "If", "ElsIf", "While", "Until"}
 INDENT_OPEN = {"For", "ForAll", "If", "While", "Loop", "Repeat"}
 INDENT_CLOSE_BEFORE = {
-    "EndFor", "EndIf", "EndWhile", "EndLoop", "Else", "ElsIf", "Until"
+    "EndFor",
+    "EndIf",
+    "EndWhile",
+    "EndLoop",
+    "Else",
+    "ElsIf",
+    "Until",
 }
 INDENT_OPEN_AFTER = {"Else", "ElsIf"}
 
@@ -41,6 +49,7 @@ _algorithm_counter = 0
 # ---------------------------------------------------------------------------
 # Title extraction
 # ---------------------------------------------------------------------------
+
 
 def collect_macros(tex_dir: Path) -> dict[str, str]:
     macros: dict[str, str] = {}
@@ -141,6 +150,7 @@ def extract_authors(main_tex: Path, macros: dict[str, str]) -> list[str]:
 # TeX file utilities
 # ---------------------------------------------------------------------------
 
+
 def get_input_order(main_tex: Path) -> list[Path]:
     root = main_tex.parent
     visited: set[Path] = set()
@@ -168,6 +178,7 @@ def get_input_order(main_tex: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 # Algorithm preprocessing
 # ---------------------------------------------------------------------------
+
 
 def find_matching_brace(text, start):
     depth = 0
@@ -280,10 +291,14 @@ def parse_algorithmic(content):
 
         if cmd in NEEDS_BRACE_ARG:
             arg, after_arg = extract_brace_arg(content, pos)
-            rest_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            rest_end = (
+                matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            )
             extra = content[after_arg:rest_end].strip()
         else:
-            rest_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            rest_end = (
+                matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            )
             arg = None
             extra = content[pos:rest_end].strip()
 
@@ -402,13 +417,33 @@ DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 TRANSLATE_MODEL = "qwen3.6-flash"
 
 SKIP_ENV_NAMES = {
-    "figure", "figure*", "table", "table*",
-    "equation", "equation*", "align", "align*", "gather", "gather*",
-    "multline", "multline*", "eqnarray", "eqnarray*",
-    "algorithmdisplay", "algorithm", "algorithm*", "algorithmic",
-    "lstlisting", "verbatim", "minted", "listing",
+    "figure",
+    "figure*",
+    "table",
+    "table*",
+    "equation",
+    "equation*",
+    "align",
+    "align*",
+    "gather",
+    "gather*",
+    "multline",
+    "multline*",
+    "eqnarray",
+    "eqnarray*",
+    "algorithmdisplay",
+    "algorithm",
+    "algorithm*",
+    "algorithmic",
+    "lstlisting",
+    "verbatim",
+    "minted",
+    "listing",
     "thebibliography",
-    "tabular", "tabular*", "tabularx", "longtable",
+    "tabular",
+    "tabular*",
+    "tabularx",
+    "longtable",
 }
 
 PURE_CMD_LINE = re.compile(
@@ -433,9 +468,13 @@ SECTION_HEADING_LINE_RE = re.compile(
 
 def create_openai_client():
     from openai import OpenAI
+
     api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
-        print("Error: DASHSCOPE_API_KEY environment variable is required for --translate", file=sys.stderr)
+        print(
+            "Error: DASHSCOPE_API_KEY environment variable is required for --translate",
+            file=sys.stderr,
+        )
         sys.exit(1)
     return OpenAI(api_key=api_key, base_url=DASHSCOPE_BASE_URL)
 
@@ -462,12 +501,16 @@ def extract_abstract(main_tex: Path) -> str:
 def extract_section_headings(paper_dir: Path) -> list[str]:
     headings = []
     for tex in paper_dir.glob("*.tex"):
-        for m in re.finditer(r"\\(?:sub)*section\*?\{([^}]+)\}", tex.read_text(errors="replace")):
+        for m in re.finditer(
+            r"\\(?:sub)*section\*?\{([^}]+)\}", tex.read_text(errors="replace")
+        ):
             headings.append(m.group(1))
     return headings
 
 
-def extract_glossary(client, title: str | None, abstract: str, headings: list[str]) -> str:
+def extract_glossary(
+    client, title: str | None, abstract: str, headings: list[str]
+) -> str:
     system_prompt = (
         "你是一位专业的科技论文翻译专家。请根据以下论文信息，提取关键术语并给出中英对照翻译表。\n\n"
         "要求：\n"
@@ -476,7 +519,9 @@ def extract_glossary(client, title: str | None, abstract: str, headings: list[st
         "3. 输出格式为每行一个：English term | 中文翻译\n"
         "4. 只输出术语表，不要其他内容"
     )
-    user_prompt = f"标题：{title or '未知'}\n摘要：{abstract}\n章节标题：{', '.join(headings)}"
+    user_prompt = (
+        f"标题：{title or '未知'}\n摘要：{abstract}\n章节标题：{', '.join(headings)}"
+    )
     print("Extracting glossary ...")
     glossary = _chat(client, system_prompt, user_prompt)
     print(f"Glossary extracted ({glossary.count(chr(10)) + 1} terms)")
@@ -527,8 +572,9 @@ def _find_skip_ranges(content: str) -> list[tuple[int, int]]:
     return ranges
 
 
-def _chunk_in_skip_range(chunk_start: int, chunk_end: int,
-                         skip_ranges: list[tuple[int, int]]) -> bool:
+def _chunk_in_skip_range(
+    chunk_start: int, chunk_end: int, skip_ranges: list[tuple[int, int]]
+) -> bool:
     for rs, re_ in skip_ranges:
         if chunk_start >= rs and chunk_end <= re_:
             return True
@@ -541,19 +587,21 @@ def _fix_braces(text: str) -> str:
     depth = 0
     result = []
     for ch in text:
-        if ch == '{':
+        if ch == "{":
             depth += 1
             result.append(ch)
-        elif ch == '}':
+        elif ch == "}":
             if depth > 0:
                 depth -= 1
                 result.append(ch)
         else:
             result.append(ch)
-    return ''.join(result)
+    return "".join(result)
 
 
-def _batch_translate(client, glossary: str, numbered_paragraphs: dict[int, str]) -> dict[int, str]:
+def _batch_translate(
+    client, glossary: str, numbered_paragraphs: dict[int, str]
+) -> dict[int, str]:
     if not numbered_paragraphs:
         return {}
 
@@ -582,7 +630,8 @@ def _batch_translate(client, glossary: str, numbered_paragraphs: dict[int, str])
         except Exception as e:
             if attempt < 2:
                 import time
-                time.sleep(2 ** attempt)
+
+                time.sleep(2**attempt)
                 print(f"  Retry {attempt + 1} ...", file=sys.stderr)
             else:
                 print(f"  Warning: batch translation failed: {e}", file=sys.stderr)
@@ -635,7 +684,9 @@ def _translate_heading_texts(client, glossary: str, texts: list[str]) -> dict[in
 
 
 def _translate_headings(client, glossary: str, content: str) -> str:
-    heading_re = re.compile(r"\\(?:section|subsection|subsubsection)\*?(?:\[[^\]]*\])?\{")
+    heading_re = re.compile(
+        r"\\(?:section|subsection|subsubsection)\*?(?:\[[^\]]*\])?\{"
+    )
     headings = []
     for m in heading_re.finditer(content):
         brace_start = m.end() - 1
@@ -686,7 +737,9 @@ def translate_file_content(client, glossary: str, content: str) -> str:
 
     numbered: dict[int, str] = {}
     for i, chunk in enumerate(chunks):
-        if _chunk_in_skip_range(chunk_positions[i][0], chunk_positions[i][1], skip_ranges):
+        if _chunk_in_skip_range(
+            chunk_positions[i][0], chunk_positions[i][1], skip_ranges
+        ):
             continue
         stripped = _strip_env_wrappers(chunk)
         stripped = _strip_heading_lines(stripped)
@@ -708,7 +761,9 @@ def translate_file_content(client, glossary: str, content: str) -> str:
     return _translate_headings(client, glossary, assembled)
 
 
-def translate_tex_files(paper_dir: Path, main_tex: Path, client, title: str | None) -> None:
+def translate_tex_files(
+    paper_dir: Path, main_tex: Path, client, title: str | None
+) -> None:
     abstract = extract_abstract(main_tex)
     headings = extract_section_headings(paper_dir)
     glossary = extract_glossary(client, title, abstract, headings)
@@ -745,6 +800,7 @@ def translate_tex_files(paper_dir: Path, main_tex: Path, client, title: str | No
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
 
 def find_main_tex(paper_dir: Path) -> Path:
     for tex in paper_dir.glob("*.tex"):
@@ -835,7 +891,7 @@ def _remove_resizebox(content: str) -> str:
     i = 0
     tag = "\\resizebox"
     while i < len(content):
-        if content[i:i + len(tag)] == tag:
+        if content[i : i + len(tag)] == tag:
             pos = i + len(tag)
             if pos < len(content) and content[pos] == "*":
                 pos += 1
@@ -892,7 +948,7 @@ def _replace_captionof_blocks(content: str) -> str:
 
         result.append(content[pos:mp_start])
 
-        inner = content[mp_start:mp_end + len(mp_end_tag)]
+        inner = content[mp_start : mp_end + len(mp_end_tag)]
         inner = re.sub(
             r"\\begin\{minipage\}(?:\[[^\]]*\])?\{[^}]*\}",
             f"\\\\begin{{{env_type}}}[H]",
@@ -921,9 +977,20 @@ def destar_floats(paper_dir: Path) -> None:
 
 
 DING_MAP = {
-    "33": "!",  "34": '"', "35": "#", "36": "$", "37": "%",
-    "38": "&",  "39": "'", "40": "(", "41": "✉",  # envelope
-    "42": "*",  "43": "+", "44": ",", "45": "-", "46": ".",
+    "33": "!",
+    "34": '"',
+    "35": "#",
+    "36": "$",
+    "37": "%",
+    "38": "&",
+    "39": "'",
+    "40": "(",
+    "41": "✉",  # envelope
+    "42": "*",
+    "43": "+",
+    "44": ",",
+    "45": "-",
+    "46": ".",
     "47": "/",
     "51": "✓",  # check mark ✓
     "52": "✗",  # ballot x ✗
@@ -933,18 +1000,18 @@ DING_MAP = {
     "56": "✠",  # Maltese cross
     "72": "★",  # black star ★
     "73": "☆",  # white star
-    "108": "▶", # right triangle
-    "110": "▼", # down triangle
-    "115": "●", # black circle ●
-    "164": "♦", # diamond
-    "168": "♣", # club
-    "170": "♥", # heart
-    "171": "♠", # spade
-    "172": "←", # left arrow
-    "173": "↑", # up arrow
-    "174": "→", # right arrow
-    "175": "↓", # down arrow
-    "228": "✉", # envelope
+    "108": "▶",  # right triangle
+    "110": "▼",  # down triangle
+    "115": "●",  # black circle ●
+    "164": "♦",  # diamond
+    "168": "♣",  # club
+    "170": "♥",  # heart
+    "171": "♠",  # spade
+    "172": "←",  # left arrow
+    "173": "↑",  # up arrow
+    "174": "→",  # right arrow
+    "175": "↓",  # down arrow
+    "228": "✉",  # envelope
 }
 
 
@@ -954,8 +1021,10 @@ def replace_ding_commands(paper_dir: Path) -> None:
         content = tex.read_text(errors="replace")
         if "\\ding{" not in content:
             continue
+
         def _repl(m):
             return DING_MAP.get(m.group(1), m.group(0))
+
         updated = pat.sub(_repl, content)
         if updated != content:
             tex.write_text(updated)
@@ -977,14 +1046,17 @@ def download(url: str, dest: Path) -> None:
     subprocess.run(["curl", "-L", url, "-o", str(dest)], check=True)
 
 
-def run_pandoc(main_tex: Path, output: Path, title: str | None,
-               authors: list[str] | None = None) -> None:
+def run_pandoc(
+    main_tex: Path, output: Path, title: str | None, authors: list[str] | None = None
+) -> None:
     args = [
         "pandoc",
         str(main_tex.name),
         "--mathml",
-        "--from", "latex",
-        "--to", "epub3",
+        "--from",
+        "latex",
+        "--to",
+        "epub3",
         "--standalone",
         "--toc",
         "--number-sections",
@@ -1002,15 +1074,67 @@ def run_pandoc(main_tex: Path, output: Path, title: str | None,
     subprocess.run(args, cwd=main_tex.parent, check=True)
 
 
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+
+def send_email(epub_path: Path, title: str | None, arxiv_id: str) -> None:
+    missing = [
+        v for v in ("EMAIL_FROM", "EMAIL_TO", "EMAIL_PASSWORD") if not os.environ.get(v)
+    ]
+    if missing:
+        print(
+            f"Error: missing environment variables for --email: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    email_from = os.environ["EMAIL_FROM"]
+    email_to = os.environ["EMAIL_TO"]
+    email_password = os.environ["EMAIL_PASSWORD"]
+    smtp_host = os.environ.get("SMTP_SSL_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_SSL_PORT", "465"))
+
+    msg = EmailMessage()
+    msg["Subject"] = f"[paper2epub] {title or arxiv_id} ({arxiv_id})"
+    msg["From"] = email_from
+    msg["To"] = email_to
+    msg.set_content(f"EPUB for arXiv paper {arxiv_id} is attached.")
+    msg.add_attachment(
+        epub_path.read_bytes(),
+        maintype="application",
+        subtype="epub+zip",
+        filename=epub_path.name,
+    )
+
+    print(f"Sending {epub_path.name} to {email_to} via {smtp_host}:{smtp_port} ...")
+    with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+        server.login(email_from, email_password)
+        server.send_message(msg)
+    print("Email sent.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert an arXiv paper to EPUB")
     parser.add_argument("arxiv_id", help="arXiv paper ID (e.g. 2402.08954)")
-    parser.add_argument("--translate", action="store_true",
-                        help="Translate to Chinese using Qwen3.6-Flash (requires DASHSCOPE_API_KEY)")
+    parser.add_argument(
+        "--translate",
+        action="store_true",
+        help="Translate to Chinese using Qwen3.6-Flash (requires DASHSCOPE_API_KEY)",
+    )
+    parser.add_argument(
+        "--email",
+        action="store_true",
+        help="Send the EPUB via email (requires EMAIL_PASSWORD, EMAIL_FROM, EMAIL_TO)",
+    )
     args = parser.parse_args()
 
     if args.translate and not os.environ.get("DASHSCOPE_API_KEY"):
-        print("Error: DASHSCOPE_API_KEY environment variable is required for --translate", file=sys.stderr)
+        print(
+            "Error: DASHSCOPE_API_KEY environment variable is required for --translate",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     arxiv_id = args.arxiv_id
@@ -1058,6 +1182,9 @@ def main():
     output = Path.cwd() / f"{arxiv_id}{suffix}.epub"
     run_pandoc(main_tex, output, title, authors)
     print(f"Generated: {output}")
+
+    if args.email:
+        send_email(output, title, arxiv_id)
 
 
 if __name__ == "__main__":

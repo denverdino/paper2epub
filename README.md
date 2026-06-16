@@ -14,6 +14,10 @@ uv run paper2epub.py 2402.08954
 
 # 带中文翻译（双语沉浸式格式）
 DASHSCOPE_API_KEY=your-key uv run paper2epub.py 2402.08954 --translate
+
+# 转换后通过邮件发送 EPUB
+EMAIL_FROM=you@gmail.com EMAIL_TO=recipient@example.com EMAIL_PASSWORD=app-password \
+  uv run paper2epub.py 2402.08954 --email
 ```
 
 Python 依赖（`pypdfium2`、`openai`）通过 PEP 723 内联元数据声明，`uv run` 会自动在隔离环境中安装，无需手动 `pip install`。
@@ -87,6 +91,11 @@ sudo apt install curl
 | 变量 | 说明 |
 |------|------|
 | `DASHSCOPE_API_KEY` | `--translate` 模式必需，阿里百炼 API 密钥 |
+| `EMAIL_PASSWORD` | `--email` 模式必需，SMTP 密码（Gmail 需使用应用专用密码） |
+| `EMAIL_FROM` | `--email` 模式必需，发件人邮箱地址 |
+| `EMAIL_TO` | `--email` 模式必需，收件人邮箱地址 |
+| `SMTP_SSL_HOST` | SMTP 服务器地址，默认 `smtp.gmail.com` |
+| `SMTP_SSL_PORT` | SMTP SSL 端口，默认 `465` |
 | `https_proxy` | 代理配置，脚本通过 `curl` 下载，支持标准代理环境变量 |
 
 ```bash
@@ -107,6 +116,7 @@ uv run paper2epub.py 2402.08954
 8. 预处理 algorithm/algorithmic 环境为 pandoc 可处理的格式
 9. （可选）通过 Qwen3.6-Flash 翻译为中文，采用两阶段策略：术语表提取 → 上下文感知段落翻译
 10. 运行 pandoc 生成 EPUB3
+11. （可选）通过 SMTP SSL 发送 EPUB 到指定邮箱
 
 ## 输出格式
 
