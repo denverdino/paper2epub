@@ -5,6 +5,7 @@
 #     "pypdfium2",
 #     "openai",
 #     "PySocks",
+#     "httpx[socks]",
 # ]
 # ///
 """Download an arXiv paper's LaTeX source and convert it to EPUB."""
