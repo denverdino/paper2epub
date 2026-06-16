@@ -39,6 +39,7 @@ With `--translate`, it uses Alibaba Bailian's Qwen3.6-Flash model to translate t
 - `curl` — downloads the arXiv source tarball
 - `pandoc` — converts LaTeX to EPUB3 (uses `--mathml` for math rendering)
 - `DASHSCOPE_API_KEY` environment variable — required for `--translate` mode (Alibaba Bailian API key)
+- `SMTP_PROXY` environment variable — optional SOCKS5 proxy for `--email` mode (format: `socks5://[user:pass@]host:port`)
 
 ## Key Details
 

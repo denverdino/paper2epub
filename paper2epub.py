@@ -4,6 +4,7 @@
 # dependencies = [
 #     "pypdfium2",
 #     "openai",
+#     "PySocks",
 # ]
 # ///
 """Download an arXiv paper's LaTeX source and convert it to EPUB."""
@@ -13,8 +14,10 @@ import os
 import re
 import shutil
 import smtplib
+import socket
 import subprocess
 import sys
+from urllib.parse import urlparse
 import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
@@ -1108,10 +1111,32 @@ def send_email(epub_path: Path, title: str | None, arxiv_id: str) -> None:
         filename=epub_path.name,
     )
 
-    print(f"Sending {epub_path.name} to {email_to} via {smtp_host}:{smtp_port} ...")
-    with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
-        server.login(email_from, email_password)
-        server.send_message(msg)
+    proxy_url = os.environ.get("SMTP_PROXY")
+    orig_socket = socket.socket
+    if proxy_url:
+        import socks
+
+        parsed = urlparse(proxy_url)
+        proxy_host = parsed.hostname
+        proxy_port = parsed.port or 1080
+        proxy_user = parsed.username
+        proxy_pass = parsed.password
+        socks.set_default_proxy(
+            socks.SOCKS5, proxy_host, proxy_port,
+            username=proxy_user, password=proxy_pass,
+        )
+        socket.socket = socks.socksocket
+        print(f"Sending {epub_path.name} to {email_to} via {smtp_host}:{smtp_port} (proxy {proxy_host}:{proxy_port}) ...")
+    else:
+        print(f"Sending {epub_path.name} to {email_to} via {smtp_host}:{smtp_port} ...")
+
+    try:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+            server.login(email_from, email_password)
+            server.send_message(msg)
+    finally:
+        if proxy_url:
+            socket.socket = orig_socket
     print("Email sent.")
 
 
@@ -1126,7 +1151,7 @@ def main():
     parser.add_argument(
         "--email",
         action="store_true",
-        help="Send the EPUB via email (requires EMAIL_PASSWORD, EMAIL_FROM, EMAIL_TO)",
+        help="Send the EPUB via email (requires EMAIL_PASSWORD, EMAIL_FROM, EMAIL_TO; optional SMTP_PROXY for SOCKS5)",
     )
     args = parser.parse_args()
 
