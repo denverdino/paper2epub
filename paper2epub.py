@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "pypdfium2",
+#     "Pillow",
 #     "openai",
 #     "PySocks",
 #     "httpx[socks]",
