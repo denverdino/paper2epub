@@ -41,6 +41,28 @@ With `--translate`, it uses Alibaba Bailian's Qwen3.6-Flash model to translate t
 - `DASHSCOPE_API_KEY` environment variable — required for `--translate` mode (Alibaba Bailian API key)
 - `SMTP_PROXY` environment variable — optional SOCKS5 proxy for `--email` mode (format: `socks5://[user:pass@]host:port`)
 
+## Testing
+
+```bash
+python3 -m pytest test_paper2epub.py -v
+```
+
+- 160 unit tests covering all pure-function logic (brace matching, content transforms, macro expansion, algorithm preprocessing, translation helpers, file-level preprocessing)
+- Tests use `tmp_path` for filesystem operations — no network or API calls needed
+- Runs in under 0.2s
+- When modifying any content transform function, run tests to verify no regressions
+
+## Code Style & Maintainability
+
+- **Single-file script** — all logic lives in `paper2epub.py`. Keep it that way.
+- **Use `_transform_tex_files` helper** for any new TeX preprocessing pass — don't repeat the iterate/read/transform/write/print boilerplate.
+- **Use `_unwrap_latex_cmd`** for stripping LaTeX commands that wrap brace arguments (e.g. `\resizebox{w}{h}{content}` → `content`). Parameterized by command name, arg count, and which arg to keep.
+- **Use `find_matching_brace`** — the single brace-matching implementation. Don't add inline brace-depth loops.
+- **Use `_parse_numbered_response`** for parsing `[N]\ntext` formatted LLM responses.
+- **Content transforms should be pure functions** (`str → str`) that can be tested without filesystem access. The file-level function is a thin wrapper calling `_transform_tex_files`.
+- **Avoid module-level mutable state.** `_algorithm_counter` is a known exception — don't add more.
+- **Keep preprocessing passes independent.** Each pass handles one concern (citations, hyperref, tables, etc.) and can run in any order.
+
 ## Key Details
 
 - Output format is EPUB3 with MathML for equations and auto-generated table of contents (`--toc`)

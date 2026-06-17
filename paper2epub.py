@@ -12,6 +12,7 @@
 """Download an arXiv paper's LaTeX source and convert it to EPUB."""
 
 import argparse
+import datetime
 import os
 import re
 import shutil
@@ -59,16 +60,24 @@ _algorithm_counter = 0
 def collect_macros(tex_dir: Path) -> dict[str, str]:
     macros: dict[str, str] = {}
     pattern = re.compile(
-        r"\\(?:newcommand|renewcommand|def)\s*\{?\\(\w+)\}?"
+        r"\\(?:newcommand|renewcommand|providecommand|DeclareRobustCommand)\s*\{?\\(\w+)\}?"
         r"(?:\[\d+\])?"
         r"\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}"
     )
+    decl_math_op_re = re.compile(
+        r"\\DeclareMathOperator\*?\s*\{\\(\w+)\}\s*\{([^}]*)\}"
+    )
     for f in tex_dir.glob("*.tex"):
-        for m in pattern.finditer(f.read_text(errors="replace")):
+        text = f.read_text(errors="replace")
+        for m in pattern.finditer(text):
             name, body = m.group(1), m.group(2)
             body = re.sub(r"\\xspace\b", "", body).strip()
             if name not in macros:
                 macros[name] = body
+        for m in decl_math_op_re.finditer(text):
+            name, body = m.group(1), m.group(2)
+            if name not in macros:
+                macros[name] = f"\\operatorname{{{body}}}"
     return macros
 
 
@@ -82,24 +91,22 @@ def expand_macros(text: str, macros: dict[str, str], depth: int = 5) -> str:
     return text
 
 
-def extract_title(main_tex: Path, macros: dict[str, str]) -> str | None:
-    content = main_tex.read_text(errors="replace")
-    content = re.sub(r"%.*", "", content)
+def _read_and_strip_comments(tex_path: Path) -> str:
+    return re.sub(r"%.*", "", tex_path.read_text(errors="replace"))
+
+
+def extract_title(main_tex: Path, macros: dict[str, str], _content: str | None = None) -> str | None:
+    content = _content or _read_and_strip_comments(main_tex)
 
     m = re.search(r"\\title\s*(?:\[[^\]]*\])?\s*\{", content)
     if not m:
         return None
 
-    start = m.end()
-    depth = 1
-    i = start
-    while i < len(content) and depth > 0:
-        if content[i] == "{":
-            depth += 1
-        elif content[i] == "}":
-            depth -= 1
-        i += 1
-    raw = content[start : i - 1]
+    brace_start = m.end() - 1
+    brace_end = find_matching_brace(content, brace_start)
+    if brace_end is None:
+        return None
+    raw = content[brace_start + 1 : brace_end]
 
     raw = re.sub(r"\\\\", " ", raw)
     raw = re.sub(r"\\[a-zA-Z]+\{([^{}]*)\}", r"\1", raw)
@@ -109,24 +116,18 @@ def extract_title(main_tex: Path, macros: dict[str, str]) -> str | None:
     return raw
 
 
-def extract_authors(main_tex: Path, macros: dict[str, str]) -> list[str]:
-    content = main_tex.read_text(errors="replace")
-    content = re.sub(r"%.*", "", content)
+def extract_authors(main_tex: Path, macros: dict[str, str], _content: str | None = None) -> list[str]:
+    content = _content or _read_and_strip_comments(main_tex)
 
     m = re.search(r"\\author\s*\{", content)
     if not m:
         return []
 
-    start = m.end()
-    depth = 1
-    i = start
-    while i < len(content) and depth > 0:
-        if content[i] == "{":
-            depth += 1
-        elif content[i] == "}":
-            depth -= 1
-        i += 1
-    raw = content[start : i - 1]
+    brace_start = m.end() - 1
+    brace_end = find_matching_brace(content, brace_start)
+    if brace_end is None:
+        return []
+    raw = content[brace_start + 1 : brace_end]
 
     # Take only the first line (before \\) — the rest are affiliations
     first_line = re.split(r"\\\\", raw)[0]
@@ -168,7 +169,7 @@ def get_input_order(main_tex: Path) -> list[Path]:
         visited.add(resolved)
         result.append(tex)
         text = tex.read_text(errors="replace")
-        for m in re.finditer(r"\\input\{([^}]+)\}", text):
+        for m in re.finditer(r"\\(?:input|include)\{([^}]+)\}", text):
             name = m.group(1)
             if not name.endswith(".tex"):
                 name += ".tex"
@@ -180,12 +181,32 @@ def get_input_order(main_tex: Path) -> list[Path]:
     return result
 
 
+def _transform_tex_files(
+    paper_dir: Path,
+    transform,
+    label: str,
+    *,
+    guard: str | None = None,
+    glob: str = "**/*.tex",
+) -> None:
+    for tex in paper_dir.glob(glob):
+        content = tex.read_text(errors="replace")
+        if guard and guard not in content:
+            continue
+        updated = transform(content)
+        if updated != content:
+            tex.write_text(updated)
+            print(f"{label}: {tex.name}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Algorithm preprocessing
 # ---------------------------------------------------------------------------
 
 
-def find_matching_brace(text, start):
+def find_matching_brace(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] != "{":
+        return None
     depth = 0
     i = start
     while i < len(text):
@@ -199,7 +220,7 @@ def find_matching_brace(text, start):
             if depth == 0:
                 return i
         i += 1
-    return len(text) - 1
+    return None
 
 
 def extract_brace_arg(text, pos):
@@ -208,6 +229,8 @@ def extract_brace_arg(text, pos):
     if pos >= len(text) or text[pos] != "{":
         return None, pos
     end = find_matching_brace(text, pos)
+    if end is None:
+        return None, pos
     return text[pos + 1 : end], end + 1
 
 
@@ -449,6 +472,17 @@ SKIP_ENV_NAMES = {
     "tabular*",
     "tabularx",
     "longtable",
+    "wrapfigure",
+    "subfigure",
+    "tabu",
+    "tabulary",
+    "tblr",
+    "xltabular",
+    "ltablex",
+    "NiceTabular",
+    "NiceTabular*",
+    "adjustbox",
+    "tikzpicture",
 }
 
 PURE_CMD_LINE = re.compile(
@@ -493,6 +527,24 @@ def _chat(client, system_prompt: str, user_prompt: str) -> str:
         ],
     )
     return resp.choices[0].message.content.strip()
+
+
+def _parse_numbered_response(raw: str, postprocess=None) -> dict[int, str]:
+    translations: dict[int, str] = {}
+    segments = re.split(r"\[(\d+)\]\s*\n", raw)
+    i = 1
+    while i < len(segments) - 1:
+        try:
+            num = int(segments[i])
+            text = segments[i + 1].strip()
+            if postprocess:
+                text = postprocess(text)
+            if text:
+                translations[num] = text
+        except (ValueError, IndexError):
+            pass
+        i += 2
+    return translations
 
 
 def extract_abstract(main_tex: Path) -> str:
@@ -642,20 +694,7 @@ def _batch_translate(
                 print(f"  Warning: batch translation failed: {e}", file=sys.stderr)
                 return {}
 
-    translations: dict[int, str] = {}
-    segments = re.split(r"\[(\d+)\]\s*\n", raw)
-    i = 1
-    while i < len(segments) - 1:
-        try:
-            num = int(segments[i])
-            text = _fix_braces(segments[i + 1].strip())
-            if text:
-                translations[num] = text
-        except (ValueError, IndexError):
-            pass
-        i += 2
-
-    return translations
+    return _parse_numbered_response(raw, postprocess=_fix_braces)
 
 
 def _translate_heading_texts(client, glossary: str, texts: list[str]) -> dict[int, str]:
@@ -673,19 +712,7 @@ def _translate_heading_texts(client, glossary: str, texts: list[str]) -> dict[in
     parts = [f"[{i}]\n{text}" for i, text in enumerate(texts)]
     user_prompt = "\n\n".join(parts)
     raw = _chat(client, system_prompt, user_prompt)
-    translations: dict[int, str] = {}
-    segments = re.split(r"\[(\d+)\]\s*\n", raw)
-    j = 1
-    while j < len(segments) - 1:
-        try:
-            num = int(segments[j])
-            t = segments[j + 1].strip()
-            if t:
-                translations[num] = t
-        except (ValueError, IndexError):
-            pass
-        j += 2
-    return translations
+    return _parse_numbered_response(raw)
 
 
 def _translate_headings(client, glossary: str, content: str) -> str:
@@ -833,6 +860,470 @@ def simplify_documentclass(tex_path: Path) -> None:
         tex_path.write_text(updated)
 
 
+# ---------------------------------------------------------------------------
+# Preamble & noise cleanup
+# ---------------------------------------------------------------------------
+
+STRIP_PACKAGES = {
+    "geometry", "hyperref", "cleveref", "natbib", "biblatex",
+    "xcolor", "color", "microtype", "fontspec", "inputenc", "fontenc",
+    "graphicx", "float", "placeins", "stfloats",
+    "titlesec", "fancyhdr", "setspace", "parskip",
+    "caption", "subcaption", "lineno", "enumitem",
+    "booktabs", "multirow", "makecell", "colortbl", "array",
+    "diagbox", "rotating", "ulem", "soul",
+    "tcolorbox", "forest", "tikz", "pgfplots",
+    "axessibility", "savetrees", "comment",
+    "wrapfig", "pifont", "fontawesome", "fontawesome5",
+    "lipsum", "blindtext", "nicematrix",
+    "babel", "etoolbox", "bm",
+    "adjustbox", "changepage", "pdflscape", "afterpage",
+    "fancyvrb", "minted",
+}
+
+_USEPACKAGE_RE = re.compile(
+    r"^\s*\\(?:usepackage|RequirePackage)"
+    r"(?:\[[^\]]*\])?"
+    r"\{([^}]+)\}\s*$",
+    re.MULTILINE,
+)
+
+_CONFIG_CMDS = [
+    "hypersetup", "captionsetup", "graphicspath", "definecolor",
+    "lstset", "lstdefinestyle", "pagestyle", "fancyhf", "fancyhead",
+    "fancyfoot", "tcbset", "usetikzlibrary", "pgfplotsset",
+    "sisetup", "DeclareSIUnit", "linespread",
+]
+
+_CONFIG_CMD_RE = re.compile(
+    r"^\s*\\(?:" + "|".join(_CONFIG_CMDS) + r")(?:\*?)(?:\[[^\]]*\])?\s*\{",
+    re.MULTILINE,
+)
+
+
+def _filter_usepackage(m: re.Match) -> str:
+    pkgs = [p.strip() for p in m.group(1).split(",")]
+    remaining = [p for p in pkgs if p not in STRIP_PACKAGES]
+    if not remaining:
+        return ""
+    if len(remaining) == len(pkgs):
+        return m.group(0)
+    return m.group(0).replace(m.group(1), ", ".join(remaining))
+
+
+def _strip_problematic_packages_content(content: str) -> str:
+    content = _USEPACKAGE_RE.sub(_filter_usepackage, content)
+
+    for cm in reversed(list(_CONFIG_CMD_RE.finditer(content))):
+        brace_pos = cm.group(0).rindex("{") + cm.start()
+        end = find_matching_brace(content, brace_pos)
+        if end is not None:
+            content = content[: cm.start()] + content[end + 1 :]
+
+    content = re.sub(
+        r"^\s*\\(?:makeatletter|makeatother)\s*$", "", content, flags=re.MULTILINE
+    )
+    return content
+
+
+def strip_problematic_packages(paper_dir: Path) -> None:
+    _transform_tex_files(paper_dir, _strip_problematic_packages_content, "Stripped packages/config")
+
+
+_NOISE_NO_ARG_RE = re.compile(
+    r"\\(?:sloppy|raggedright|raggedbottom|noindent"
+    r"|smallskip|medskip|bigskip|vfill|hfill"
+    r"|allowbreak|linebreak|pagebreak"
+    r"|newpage|clearpage|cleardoublepage"
+    r"|centering|tableofcontents|FloatBarrier"
+    r"|maketitle)\b\s*"
+)
+
+_NOISE_ONE_ARG = [
+    "vspace", "hspace", "enlargethispage",
+    "phantom", "vphantom", "hphantom",
+    "todo", "fixme", "marginpar",
+]
+
+_NOISE_TWO_ARG = [
+    "setlength", "addtolength", "setcounter", "addtocounter",
+]
+
+_STRIP_ENVS = {"tikzpicture", "comment"}
+
+_STRIP_ENV_RE = re.compile(
+    r"\\begin\{(" + "|".join(_STRIP_ENVS) + r")\}.*?\\end\{\1\}",
+    re.DOTALL,
+)
+
+
+def _strip_noise_content(content: str) -> str:
+    content = _NOISE_NO_ARG_RE.sub("", content)
+    content = content.replace(r"\today", datetime.date.today().strftime("%B %d, %Y"))
+
+    for cmd in _NOISE_ONE_ARG:
+        tag = f"\\{cmd}"
+        while tag in content:
+            idx = content.index(tag)
+            pos = idx + len(tag)
+            if pos < len(content) and content[pos] == "*":
+                pos += 1
+            arg, pos = extract_brace_arg(content, pos)
+            if arg is not None:
+                content = content[:idx] + content[pos:]
+            else:
+                break
+
+    for cmd in _NOISE_TWO_ARG:
+        tag = f"\\{cmd}"
+        while tag in content:
+            idx = content.index(tag)
+            pos = idx + len(tag)
+            _, pos = extract_brace_arg(content, pos)
+            _, pos = extract_brace_arg(content, pos)
+            content = content[:idx] + content[pos:]
+
+    return _STRIP_ENV_RE.sub("", content)
+
+
+def strip_noise_commands(paper_dir: Path) -> None:
+    _transform_tex_files(paper_dir, _strip_noise_content, "Stripped noise commands")
+
+
+# ---------------------------------------------------------------------------
+# Citation normalization
+# ---------------------------------------------------------------------------
+
+_CITE_ALIASES = [
+    "parencite", "textcite", "autocite", "fullcite", "footcite",
+    "citeauthor", "citetitle",
+    "citep", "citet", "Citet", "Citep",
+    "citealt", "citealp", "citenum", "citeyear",
+]
+
+_CITE_RE = re.compile(
+    r"\\(?:" + "|".join(_CITE_ALIASES) + r")"
+    r"\*?"
+    r"(?:\[[^\]]*\])?"
+    r"(?:\[[^\]]*\])?"
+    r"\{([^}]+)\}"
+)
+
+
+def normalize_citations(paper_dir: Path) -> None:
+    _transform_tex_files(
+        paper_dir, lambda c: _CITE_RE.sub(r"\\cite{\1}", c), "Normalized citations"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hyperref preprocessing
+# ---------------------------------------------------------------------------
+
+
+def _unwrap_latex_cmd(content: str, tag: str, num_args: int, keep: int = -1, *, star: bool = False) -> str:
+    result: list[str] = []
+    i = 0
+    if keep < 0:
+        keep = num_args + keep
+    while i < len(content):
+        if content[i:i + len(tag)] == tag and (
+            i + len(tag) >= len(content) or not content[i + len(tag)].isalpha()
+        ):
+            pos = i + len(tag)
+            if star and pos < len(content) and content[pos] == "*":
+                pos += 1
+            kept = None
+            for n in range(num_args):
+                arg, pos = extract_brace_arg(content, pos)
+                if n == keep:
+                    kept = arg
+            if kept is not None:
+                result.append(kept)
+                i = pos
+                continue
+        result.append(content[i])
+        i += 1
+    return "".join(result)
+
+
+_HYPERREF_RE = re.compile(r"\\hyperref\[([^\]]*)\]\{([^}]*)\}")
+
+
+def _preprocess_hyperref_content(content: str) -> str:
+    if "\\texorpdfstring" in content:
+        content = _unwrap_latex_cmd(content, "\\texorpdfstring", 2, keep=0)
+    return _HYPERREF_RE.sub(r"\2", content)
+
+
+def preprocess_hyperref(paper_dir: Path) -> None:
+    _transform_tex_files(paper_dir, _preprocess_hyperref_content, "Preprocessed hyperref")
+
+
+# ---------------------------------------------------------------------------
+# Table environment normalization
+# ---------------------------------------------------------------------------
+
+_TABLE_SIMPLE_RENAME = {
+    "tabu": "tabular", "ltablex": "longtable",
+    "NiceTabular": "tabular", "NiceTabular*": "tabular",
+}
+
+_TABLE_STRIP_WIDTH = {
+    "tabularx": "tabular",
+    "tabulary": "tabular",
+    "xltabular": "longtable",
+}
+
+_TABLE_STRIP_WIDTH_RES = {
+    src: (re.compile(r"\\begin\{" + re.escape(src) + r"\}\s*(?:\[[^\]]*\])?\s*\{[^}]*\}"), dst)
+    for src, dst in _TABLE_STRIP_WIDTH.items()
+}
+
+
+def _normalize_table_envs_content(content: str) -> str:
+    for src, dst in _TABLE_SIMPLE_RENAME.items():
+        content = content.replace(f"\\begin{{{src}}}", f"\\begin{{{dst}}}")
+        content = content.replace(f"\\end{{{src}}}", f"\\end{{{dst}}}")
+
+    for src, (pat, dst) in _TABLE_STRIP_WIDTH_RES.items():
+        content = pat.sub(f"\\\\begin{{{dst}}}", content)
+        content = content.replace(f"\\end{{{src}}}", f"\\end{{{dst}}}")
+
+    if "\\begin{tblr}" in content:
+        content = re.sub(
+            r"\\begin\{tblr\}\s*(?:\[[^\]]*\])?\s*\{[^}]*\}",
+            r"\\begin{tabular}{l}",
+            content,
+        )
+        content = content.replace("\\end{tblr}", "\\end{tabular}")
+    return content
+
+
+def normalize_table_envs(paper_dir: Path) -> None:
+    _transform_tex_files(paper_dir, _normalize_table_envs_content, "Normalized table envs")
+
+
+# ---------------------------------------------------------------------------
+# wrapfigure conversion
+# ---------------------------------------------------------------------------
+
+_WRAPFIG_RE = re.compile(
+    r"\\begin\{wrapfigure\}(?:\[[^\]]*\])?(?:\{[^}]*\}){1,2}"
+)
+
+
+def convert_wrapfigure(paper_dir: Path) -> None:
+    def _convert(c: str) -> str:
+        return _WRAPFIG_RE.sub(r"\\begin{figure}[H]", c).replace(
+            "\\end{wrapfigure}", "\\end{figure}"
+        )
+    _transform_tex_files(paper_dir, _convert, "Converted wrapfigure", guard="\\begin{wrapfigure}")
+
+
+# ---------------------------------------------------------------------------
+# Subfigure unwrapping
+# ---------------------------------------------------------------------------
+
+_SUBFIG_BEGIN_RE = re.compile(
+    r"\\begin\{subfigure\}(?:\[[^\]]*\])?\{[^}]*\}"
+)
+
+
+def unwrap_subfigures(paper_dir: Path) -> None:
+    def _unwrap(c: str) -> str:
+        return _SUBFIG_BEGIN_RE.sub("", c).replace("\\end{subfigure}", "")
+    _transform_tex_files(paper_dir, _unwrap, "Unwrapped subfigures", guard="\\begin{subfigure}")
+
+
+# ---------------------------------------------------------------------------
+# adjustbox stripping
+# ---------------------------------------------------------------------------
+
+
+def _remove_adjustbox_cmd(content: str) -> str:
+    return _unwrap_latex_cmd(content, "\\adjustbox", 2)
+
+
+_ADJUSTBOX_ENV_BEGIN_RE = re.compile(r"\\begin\{adjustbox\}\{[^}]*\}")
+
+
+def strip_adjustbox(paper_dir: Path) -> None:
+    def _strip(c: str) -> str:
+        if "\\adjustbox{" in c:
+            c = _remove_adjustbox_cmd(c)
+        c = _ADJUSTBOX_ENV_BEGIN_RE.sub("", c)
+        return c.replace("\\end{adjustbox}", "")
+    _transform_tex_files(paper_dir, _strip, "Stripped adjustbox", guard="adjustbox")
+
+
+# ---------------------------------------------------------------------------
+# Theorem preprocessing
+# ---------------------------------------------------------------------------
+
+_NEWTHEOREM_RE = re.compile(
+    r"\\newtheorem\*?\{(\w+)\}"
+    r"(?:\[[^\]]*\])?"
+    r"\{([^}]+)\}"
+    r"(?:\[[^\]]*\])?"
+)
+
+_BUILTIN_THEOREMS = {
+    "theorem": "Theorem",
+    "lemma": "Lemma",
+    "proposition": "Proposition",
+    "corollary": "Corollary",
+    "definition": "Definition",
+    "example": "Example",
+    "remark": "Remark",
+    "assumption": "Assumption",
+    "claim": "Claim",
+    "conjecture": "Conjecture",
+    "observation": "Observation",
+    "note": "Note",
+    "fact": "Fact",
+    "property": "Property",
+    "condition": "Condition",
+    "hypothesis": "Hypothesis",
+}
+
+
+def preprocess_theorems(paper_dir: Path) -> None:
+    declared: dict[str, str] = {}
+
+    for tex in paper_dir.rglob("*.tex"):
+        content = tex.read_text(errors="replace")
+        for m in _NEWTHEOREM_RE.finditer(content):
+            env_name, label = m.group(1), m.group(2)
+            if env_name not in declared:
+                declared[env_name] = label
+
+    for name, label in _BUILTIN_THEOREMS.items():
+        if name not in declared:
+            declared[name] = label
+
+    if not declared:
+        return
+
+    counters: dict[str, int] = {}
+
+    for tex in paper_dir.rglob("*.tex"):
+        content = tex.read_text(errors="replace")
+        updated = content
+
+        for env_name, label in declared.items():
+            begin_tag = f"\\begin{{{env_name}}}"
+            end_tag = f"\\end{{{env_name}}}"
+            if begin_tag not in updated:
+                continue
+
+            if env_name not in counters:
+                counters[env_name] = 0
+
+            result: list[str] = []
+            i = 0
+            while i < len(updated):
+                if updated[i:i + len(begin_tag)] == begin_tag:
+                    pos = i + len(begin_tag)
+                    opt_name = ""
+                    while pos < len(updated) and updated[pos] in " \t\n\r":
+                        pos += 1
+                    if pos < len(updated) and updated[pos] == "[":
+                        bracket_end = updated.index("]", pos)
+                        opt_name = updated[pos + 1:bracket_end].strip()
+                        pos = bracket_end + 1
+
+                    end_pos = updated.find(end_tag, pos)
+                    if end_pos == -1:
+                        result.append(updated[i:])
+                        break
+
+                    body = updated[pos:end_pos].strip()
+                    counters[env_name] += 1
+                    n = counters[env_name]
+
+                    header = f"\\textbf{{{label} {n}}}"
+                    if opt_name:
+                        header += f" \\textit{{({opt_name})}}"
+                    header += "\\textbf{.}"
+
+                    result.append(f"\n\\begin{{quote}}\n{header} {body}\n\\end{{quote}}\n")
+                    i = end_pos + len(end_tag)
+                else:
+                    result.append(updated[i])
+                    i += 1
+            updated = "".join(result)
+
+        if "\\begin{proof}" in updated:
+            begin_tag = "\\begin{proof}"
+            end_tag = "\\end{proof}"
+            result = []
+            i = 0
+            while i < len(updated):
+                if updated[i:i + len(begin_tag)] == begin_tag:
+                    pos = i + len(begin_tag)
+                    while pos < len(updated) and updated[pos] in " \t\n\r":
+                        pos += 1
+                    end_pos = updated.find(end_tag, pos)
+                    if end_pos == -1:
+                        result.append(updated[i:])
+                        break
+                    body = updated[pos:end_pos].strip()
+                    result.append(
+                        f"\n\\begin{{quote}}\n\\textit{{Proof.}} {body} \\hfill$\\square$\n\\end{{quote}}\n"
+                    )
+                    i = end_pos + len(end_tag)
+                else:
+                    result.append(updated[i])
+                    i += 1
+            updated = "".join(result)
+
+        if updated != content:
+            tex.write_text(updated)
+            print(f"Preprocessed theorems: {tex.name}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Code listing normalization
+# ---------------------------------------------------------------------------
+
+
+def _normalize_code_listings_content(content: str) -> str:
+    content = re.sub(
+        r"\\begin\{minted\}(?:\[[^\]]*\])?\{[^}]*\}",
+        r"\\begin{verbatim}",
+        content,
+    )
+    content = content.replace("\\end{minted}", "\\end{verbatim}")
+
+    tag = "\\mintinline"
+    while tag in content:
+        idx = content.index(tag)
+        pos = idx + len(tag)
+        if pos < len(content) and content[pos] == "[":
+            bracket_end = content.index("]", pos)
+            pos = bracket_end + 1
+        _, pos = extract_brace_arg(content, pos)
+        code, pos = extract_brace_arg(content, pos)
+        if code is not None:
+            content = content[:idx] + f"\\texttt{{{code}}}" + content[pos:]
+        else:
+            break
+
+    content = re.sub(
+        r"\\begin\{lstlisting\}\s*\[[^\]]*\]",
+        r"\\begin{lstlisting}",
+        content,
+    )
+    return content
+
+
+def normalize_code_listings(paper_dir: Path) -> None:
+    _transform_tex_files(
+        paper_dir, _normalize_code_listings_content, "Normalized code listings",
+    )
+
+
 def convert_pdf_images(paper_dir: Path) -> None:
     import pypdfium2 as pdfium
 
@@ -848,79 +1339,33 @@ def convert_pdf_images(paper_dir: Path) -> None:
             print(f"Warning: could not convert {pdf_path}: {e}", file=sys.stderr)
 
 
-def _find_brace_block(text: str, start: int) -> int | None:
-    if start >= len(text) or text[start] != "{":
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-    return None
+def _normalize_siunitx_content(content: str) -> str:
+    for m in reversed(list(re.finditer(r"\\begin\{tabular[*x]?\}\s*", content))):
+        brace_start = m.end()
+        brace_end = find_matching_brace(content, brace_start)
+        if brace_end is None:
+            continue
+        spec = content[brace_start + 1 : brace_end]
+        new_spec = re.sub(r"S\s*(?:\[[^\]]*\])?", "r", spec)
+        if new_spec != spec:
+            content = content[: brace_start + 1] + new_spec + content[brace_end:]
+    return content
 
 
 def normalize_siunitx_columns(paper_dir: Path) -> None:
-    for tex in paper_dir.glob("**/*.tex"):
-        content = tex.read_text()
-        updated = content
-        for m in reversed(list(re.finditer(r"\\begin\{tabular[*x]?\}\s*", updated))):
-            brace_start = m.end()
-            brace_end = _find_brace_block(updated, brace_start)
-            if brace_end is None:
-                continue
-            spec = updated[brace_start + 1 : brace_end]
-            new_spec = re.sub(r"S\s*(?:\[[^\]]*\])?", "r", spec)
-            if new_spec != spec:
-                updated = updated[: brace_start + 1] + new_spec + updated[brace_end:]
-        if updated != content:
-            tex.write_text(updated)
-            print(f"Normalized siunitx columns: {tex}", file=sys.stderr)
+    _transform_tex_files(paper_dir, _normalize_siunitx_content, "Normalized siunitx columns")
 
 
 def strip_resizebox(paper_dir: Path) -> None:
-    for tex in paper_dir.rglob("*.tex"):
-        content = tex.read_text(errors="replace")
-        if "\\resizebox" not in content:
-            continue
-        updated = _remove_resizebox(content)
-        if updated != content:
-            tex.write_text(updated)
-            print(f"Stripped resizebox: {tex.name}", file=sys.stderr)
+    _transform_tex_files(paper_dir, _remove_resizebox, "Stripped resizebox", guard="\\resizebox")
 
 
 def _remove_resizebox(content: str) -> str:
-    result = []
-    i = 0
-    tag = "\\resizebox"
-    while i < len(content):
-        if content[i : i + len(tag)] == tag:
-            pos = i + len(tag)
-            if pos < len(content) and content[pos] == "*":
-                pos += 1
-            _, pos = extract_brace_arg(content, pos)
-            _, pos = extract_brace_arg(content, pos)
-            inner, pos = extract_brace_arg(content, pos)
-            if inner is not None:
-                result.append(inner)
-                i = pos
-                continue
-        result.append(content[i])
-        i += 1
-    return "".join(result)
+    return _unwrap_latex_cmd(content, "\\resizebox", 3, star=True)
 
 
 def rewrite_captionof(paper_dir: Path) -> None:
-    for tex in paper_dir.rglob("*.tex"):
-        content = tex.read_text(errors="replace")
-        if "\\captionof{" not in content:
-            continue
-        updated = _replace_captionof_blocks(content)
-        if updated != content:
-            tex.write_text(updated)
-            print(f"Rewrote captionof: {tex.name}", file=sys.stderr)
+    _transform_tex_files(paper_dir, _replace_captionof_blocks, "Rewrote captionof", guard="\\captionof{")
 
 
 def _replace_captionof_blocks(content: str) -> str:
@@ -970,15 +1415,12 @@ def _replace_captionof_blocks(content: str) -> str:
 
 
 def destar_floats(paper_dir: Path) -> None:
-    for tex in paper_dir.rglob("*.tex"):
-        content = tex.read_text(errors="replace")
-        updated = content
+    def _destar(c: str) -> str:
         for env in ("table", "figure"):
-            updated = updated.replace(f"\\begin{{{env}*}}", f"\\begin{{{env}}}")
-            updated = updated.replace(f"\\end{{{env}*}}", f"\\end{{{env}}}")
-        if updated != content:
-            tex.write_text(updated)
-            print(f"De-starred floats: {tex.name}", file=sys.stderr)
+            c = c.replace(f"\\begin{{{env}*}}", f"\\begin{{{env}}}")
+            c = c.replace(f"\\end{{{env}*}}", f"\\end{{{env}}}")
+        return c
+    _transform_tex_files(paper_dir, _destar, "De-starred floats")
 
 
 DING_MAP = {
@@ -1020,31 +1462,23 @@ DING_MAP = {
 }
 
 
+_DING_RE = re.compile(r"\\ding\{(\d+)\}")
+
+
 def replace_ding_commands(paper_dir: Path) -> None:
-    pat = re.compile(r"\\ding\{(\d+)\}")
-    for tex in paper_dir.rglob("*.tex"):
-        content = tex.read_text(errors="replace")
-        if "\\ding{" not in content:
-            continue
-
-        def _repl(m):
-            return DING_MAP.get(m.group(1), m.group(0))
-
-        updated = pat.sub(_repl, content)
-        if updated != content:
-            tex.write_text(updated)
-            print(f"Replaced \\ding commands: {tex.name}", file=sys.stderr)
+    _transform_tex_files(
+        paper_dir,
+        lambda c: _DING_RE.sub(lambda m: DING_MAP.get(m.group(1), m.group(0)), c),
+        "Replaced \\ding commands",
+        guard="\\ding{",
+    )
 
 
 def preprocess_algorithms(paper_dir: Path) -> None:
-    for tex in paper_dir.glob("*.tex"):
-        content = tex.read_text()
-        if "\\begin{algorithm" not in content:
-            continue
-        processed = process_algorithms(content)
-        if processed != content:
-            tex.write_text(processed)
-            print(f"Preprocessed algorithms: {tex}")
+    _transform_tex_files(
+        paper_dir, process_algorithms, "Preprocessed algorithms",
+        guard="\\begin{algorithm", glob="*.tex",
+    )
 
 
 def download(url: str, dest: Path) -> None:
@@ -1184,21 +1618,32 @@ def main():
     print(f"Using TeX file: {main_tex}")
 
     simplify_documentclass(main_tex)
+    strip_problematic_packages(paper_dir)
+    strip_noise_commands(paper_dir)
 
     macros = collect_macros(paper_dir)
-    title = extract_title(main_tex, macros)
+    main_content = _read_and_strip_comments(main_tex)
+    title = extract_title(main_tex, macros, main_content)
     if title:
         print(f"Paper title: {title}")
-    authors = extract_authors(main_tex, macros)
+    authors = extract_authors(main_tex, macros, main_content)
     if authors:
         print(f"Authors: {', '.join(authors)}")
 
     convert_pdf_images(paper_dir)
+    normalize_citations(paper_dir)
+    preprocess_hyperref(paper_dir)
+    normalize_table_envs(paper_dir)
     normalize_siunitx_columns(paper_dir)
     strip_resizebox(paper_dir)
+    strip_adjustbox(paper_dir)
+    convert_wrapfigure(paper_dir)
+    unwrap_subfigures(paper_dir)
     rewrite_captionof(paper_dir)
     destar_floats(paper_dir)
     replace_ding_commands(paper_dir)
+    preprocess_theorems(paper_dir)
+    normalize_code_listings(paper_dir)
     preprocess_algorithms(paper_dir)
 
     if args.translate:
