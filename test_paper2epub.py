@@ -669,7 +669,7 @@ class TestParseAlgorithmic:
 class TestReplaceCallInText:
     def test_outside_math(self):
         result = p.replace_call_in_text(r"\Call{Foo}{x, y}")
-        assert r"\textsc{Foo}(x, y)" == result
+        assert r"\operatorname{Foo}(x, y)" == result
 
     def test_inside_math(self):
         result = p.replace_call_in_text(r"$\Call{Bar}{z}$")
@@ -678,6 +678,22 @@ class TestReplaceCallInText:
     def test_no_call(self):
         text = "no calls here"
         assert p.replace_call_in_text(text) == text
+
+
+class TestNormalizeTextsc:
+    def test_replaces_textsc(self):
+        assert p._TEXTSC_RE.sub(r"\\text", r"\textsc{Hello}") == r"\text{Hello}"
+
+    def test_preserves_text(self):
+        assert p._TEXTSC_RE.sub(r"\\text", r"\text{ok}") == r"\text{ok}"
+
+    def test_in_math(self):
+        src = r"$\textsc{Foo}(x)$"
+        assert p._TEXTSC_RE.sub(r"\\text", src) == r"$\text{Foo}(x)$"
+
+    def test_no_match(self):
+        src = "no textsc here"
+        assert p._TEXTSC_RE.sub(r"\\text", src) == src
 
 
 class TestProcessAlgorithms:
@@ -926,6 +942,18 @@ class TestFilePreprocessing:
         p.replace_ding_commands(tmp_path)
         assert tex.read_text() == "✓"
 
+    def test_replace_textcircled_math(self, tmp_path):
+        tex = tmp_path / "paper.tex"
+        tex.write_text(r"step $\textcircled{1}$ and $\textcircled{2}$")
+        p.replace_textcircled(tmp_path)
+        assert tex.read_text() == "step ① and ②"
+
+    def test_replace_textcircled_bare(self, tmp_path):
+        tex = tmp_path / "paper.tex"
+        tex.write_text(r"\textcircled{3}")
+        p.replace_textcircled(tmp_path)
+        assert tex.read_text() == "③"
+
     def test_normalize_table_envs(self, tmp_path):
         tex = tmp_path / "paper.tex"
         tex.write_text(r"\begin{tabu}data\end{tabu}")
@@ -933,6 +961,30 @@ class TestFilePreprocessing:
         result = tex.read_text()
         assert r"\begin{tabular}" in result
         assert r"\end{tabular}" in result
+
+    def test_unwrap_makecell(self, tmp_path):
+        tex = tmp_path / "paper.tex"
+        tex.write_text(r"\makecell{Line 1 \\ Line 2}")
+        p.unwrap_makecell(tmp_path)
+        assert tex.read_text() == "Line 1 Line 2"
+
+    def test_unwrap_makecell_with_alignment(self, tmp_path):
+        tex = tmp_path / "paper.tex"
+        tex.write_text(r"\makecell[c]{A \\ B}")
+        p.unwrap_makecell(tmp_path)
+        assert tex.read_text() == "A B"
+
+    def test_strip_minipage_in_tables(self, tmp_path):
+        tex = tmp_path / "paper.tex"
+        tex.write_text(
+            r"\begin{tabular}{cc}"
+            r"\begin{minipage}{2cm}\includegraphics{img}\end{minipage}"
+            r" & text \end{tabular}"
+        )
+        p.strip_minipage_in_tables(tmp_path)
+        result = tex.read_text()
+        assert r"\begin{minipage}" not in result
+        assert r"\includegraphics{img}" in result
 
     def test_normalize_code_listings(self, tmp_path):
         tex = tmp_path / "paper.tex"
@@ -965,3 +1017,71 @@ class TestFilePreprocessing:
         result = tex.read_text()
         assert "hyperref" not in result
         assert "amsmath" in result
+
+
+class TestUnwrapMakecell:
+    def test_basic(self):
+        assert p._unwrap_makecell_content(r"\makecell{A \\ B}") == "A B"
+
+    def test_with_alignment(self):
+        assert p._unwrap_makecell_content(r"\makecell[c]{A \\ B}") == "A B"
+
+    def test_star(self):
+        assert p._unwrap_makecell_content(r"\makecell*{X \\ Y}") == "X Y"
+
+    def test_nested_formatting(self):
+        result = p._unwrap_makecell_content(r"\makecell{\textbf{Bold} \\ normal}")
+        assert result == r"\textbf{Bold} normal"
+
+    def test_three_lines(self):
+        result = p._unwrap_makecell_content(r"\makecell{A \\ B \\ C}")
+        assert result == "A B C"
+
+    def test_backslash_with_optional_arg(self):
+        result = p._unwrap_makecell_content(r"\makecell{A \\[2pt] B}")
+        assert result == "A B"
+
+    def test_no_makecell(self):
+        text = r"plain text \\ more"
+        assert p._unwrap_makecell_content(text) == text
+
+    def test_preserves_surrounding(self):
+        result = p._unwrap_makecell_content(r"before \makecell{A \\ B} after")
+        assert result == "before A B after"
+
+
+class TestStripMinipageInTables:
+    def test_strips_inside_tabular(self):
+        content = (
+            r"\begin{tabular}{cc}"
+            r"{col} "
+            r"\begin{minipage}{2.5cm}"
+            r"\includegraphics[width=\linewidth]{img.png}"
+            r"\end{minipage}"
+            r" & text"
+            r"\end{tabular}"
+        )
+        result = p._strip_minipage_in_tables_content(content)
+        assert r"\begin{minipage}" not in result
+        assert r"\end{minipage}" not in result
+        assert r"\includegraphics[width=\linewidth]{img.png}" in result
+
+    def test_preserves_outside_tabular(self):
+        content = (
+            r"\begin{figure}"
+            r"\begin{minipage}{0.5\textwidth}img\end{minipage}"
+            r"\end{figure}"
+        )
+        result = p._strip_minipage_in_tables_content(content)
+        assert r"\begin{minipage}" in result
+
+    def test_minipage_with_optional_position(self):
+        content = (
+            r"\begin{tabular}{c}"
+            r"{l} "
+            r"\begin{minipage}[t]{2cm}content\end{minipage}"
+            r"\end{tabular}"
+        )
+        result = p._strip_minipage_in_tables_content(content)
+        assert r"\begin{minipage}" not in result
+        assert "content" in result

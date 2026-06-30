@@ -246,18 +246,8 @@ def replace_call_in_text(text):
                 name, pos = extract_brace_arg(text, j)
                 args, pos = extract_brace_arg(text, pos)
                 if name is not None:
-                    prefix = "".join(result)
-                    dollars = sum(
-                        1
-                        for k, c in enumerate(prefix)
-                        if c == "$" and (k == 0 or prefix[k - 1] != "\\")
-                    )
-                    in_math = dollars % 2 == 1
                     args_str = args if args else ""
-                    if in_math:
-                        result.append(f"\\operatorname{{{name}}}({args_str})")
-                    else:
-                        result.append(f"\\textsc{{{name}}}({args_str})")
+                    result.append(f"\\operatorname{{{name}}}({args_str})")
                     i = pos
                     continue
         result.append(text[i])
@@ -1104,6 +1094,69 @@ def normalize_table_envs(paper_dir: Path) -> None:
     _transform_tex_files(paper_dir, _normalize_table_envs_content, "Normalized table envs")
 
 
+def _unwrap_makecell_content(content: str) -> str:
+    result: list[str] = []
+    i = 0
+    tag = "\\makecell"
+    while i < len(content):
+        if content[i : i + len(tag)] == tag and (
+            i + len(tag) >= len(content) or not content[i + len(tag)].isalpha()
+        ):
+            pos = i + len(tag)
+            if pos < len(content) and content[pos] == "*":
+                pos += 1
+            while pos < len(content) and content[pos] in " \t\n\r":
+                pos += 1
+            if pos < len(content) and content[pos] == "[":
+                bracket_end = content.find("]", pos)
+                if bracket_end != -1:
+                    pos = bracket_end + 1
+            arg, pos = extract_brace_arg(content, pos)
+            if arg is not None:
+                flat = re.sub(r"\s*\\\\(?:\s*\[[^\]]*\])?\s*", " ", arg)
+                flat = re.sub(r"\s*\\newline\s*", " ", flat)
+                result.append(flat.strip())
+                i = pos
+                continue
+        result.append(content[i])
+        i += 1
+    return "".join(result)
+
+
+def unwrap_makecell(paper_dir: Path) -> None:
+    _transform_tex_files(paper_dir, _unwrap_makecell_content, "Unwrapped makecell", guard="\\makecell")
+
+
+_MINIPAGE_BEGIN_RE = re.compile(
+    r"\\begin\{minipage\}(?:\s*\[[^\]]*\])*\s*\{[^}]*\}"
+)
+
+
+def _strip_minipage_in_tables_content(content: str) -> str:
+    for m in reversed(list(re.finditer(r"\\begin\{tabular[*x]?\}", content))):
+        tab_start = m.start()
+        tab_body_start = m.end()
+        brace_pos = content.find("{", tab_body_start)
+        if brace_pos == -1:
+            continue
+        brace_end = find_matching_brace(content, brace_pos)
+        if brace_end is None:
+            continue
+        tab_end_tag = content.find("\\end{" + m.group()[7:], brace_end)
+        if tab_end_tag == -1:
+            continue
+        region = content[tab_body_start:tab_end_tag]
+        new_region = _MINIPAGE_BEGIN_RE.sub("", region)
+        new_region = new_region.replace("\\end{minipage}", "")
+        if new_region != region:
+            content = content[:tab_body_start] + new_region + content[tab_end_tag:]
+    return content
+
+
+def strip_minipage_in_tables(paper_dir: Path) -> None:
+    _transform_tex_files(paper_dir, _strip_minipage_in_tables_content, "Stripped minipage in tables", guard="\\begin{minipage}")
+
+
 # ---------------------------------------------------------------------------
 # wrapfigure conversion
 # ---------------------------------------------------------------------------
@@ -1474,6 +1527,35 @@ def replace_ding_commands(paper_dir: Path) -> None:
     )
 
 
+_TEXTCIRCLED_MAP = {str(i): chr(0x2460 + i - 1) for i in range(1, 21)}  # ①-⑳
+_TEXTCIRCLED_RE = re.compile(r"\$?\\textcircled\{(\d+)\}\$?")
+
+
+def _replace_textcircled(content: str) -> str:
+    return _TEXTCIRCLED_RE.sub(
+        lambda m: _TEXTCIRCLED_MAP.get(m.group(1), m.group(0)), content
+    )
+
+
+def replace_textcircled(paper_dir: Path) -> None:
+    _transform_tex_files(
+        paper_dir, _replace_textcircled, "Replaced \\textcircled",
+        guard="\\textcircled{",
+    )
+
+
+_TEXTSC_RE = re.compile(r"\\textsc\b")
+
+
+def normalize_textsc(paper_dir: Path) -> None:
+    _transform_tex_files(
+        paper_dir,
+        lambda c: _TEXTSC_RE.sub(r"\\text", c),
+        "Replaced \\textsc with \\text",
+        guard="\\textsc",
+    )
+
+
 def preprocess_algorithms(paper_dir: Path) -> None:
     _transform_tex_files(
         paper_dir, process_algorithms, "Preprocessed algorithms",
@@ -1620,6 +1702,7 @@ def main():
     simplify_documentclass(main_tex)
     strip_problematic_packages(paper_dir)
     strip_noise_commands(paper_dir)
+    normalize_textsc(paper_dir)
 
     macros = collect_macros(paper_dir)
     main_content = _read_and_strip_comments(main_tex)
@@ -1634,6 +1717,8 @@ def main():
     normalize_citations(paper_dir)
     preprocess_hyperref(paper_dir)
     normalize_table_envs(paper_dir)
+    unwrap_makecell(paper_dir)
+    strip_minipage_in_tables(paper_dir)
     normalize_siunitx_columns(paper_dir)
     strip_resizebox(paper_dir)
     strip_adjustbox(paper_dir)
@@ -1642,6 +1727,7 @@ def main():
     rewrite_captionof(paper_dir)
     destar_floats(paper_dir)
     replace_ding_commands(paper_dir)
+    replace_textcircled(paper_dir)
     preprocess_theorems(paper_dir)
     normalize_code_listings(paper_dir)
     preprocess_algorithms(paper_dir)
