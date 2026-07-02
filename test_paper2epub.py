@@ -441,6 +441,10 @@ class TestPreprocessHyperref:
         result = p._preprocess_hyperref_content(r"\hyperref[sec:intro]{Introduction}")
         assert result == "Introduction"
 
+    def test_hyperref_unwrapped_with_nested_visible_text(self):
+        result = p._preprocess_hyperref_content(r"\hyperref[sec:intro]{See \textbf{Introduction}}")
+        assert result == r"See \textbf{Introduction}"
+
     def test_texorpdfstring(self):
         result = p._preprocess_hyperref_content(r"\texorpdfstring{$\alpha$}{alpha}")
         assert result == "$\\alpha$"
@@ -1230,3 +1234,17 @@ class TestArxivCompatibilityHelpers:
         content = r"\includegraphics[width=.8\linewidth]{figs/plot.pdf}"
         result = p._rewrite_pdf_image_refs_content(content)
         assert result == r"\includegraphics[width=.8\linewidth]{figs/plot.png}"
+
+    def test_graphicspath_dirs_parse_multiple_directories(self):
+        content = r"\graphicspath{{figures/}{images/generated/}}"
+        assert p._iter_graphicspath_dirs(content) == ["figures", "images/generated"]
+
+    def test_pandoc_resource_paths_include_graphicspath(self, tmp_path):
+        (tmp_path / "main.tex").write_text(r"\graphicspath{{assets/plots/}}")
+        assert "assets/plots" in p._pandoc_resource_paths(tmp_path)
+
+    def test_strip_problematic_packages_preserves_graphicspath(self):
+        content = r"\graphicspath{{figures/}}" + "\n" + r"\hypersetup{colorlinks=true}"
+        result = p._strip_problematic_packages_content(content)
+        assert r"\graphicspath{{figures/}}" in result
+        assert "hypersetup" not in result

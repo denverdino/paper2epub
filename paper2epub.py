@@ -964,7 +964,7 @@ _USEPACKAGE_RE = re.compile(
 )
 
 _CONFIG_CMDS = [
-    "hypersetup", "captionsetup", "graphicspath", "definecolor",
+    "hypersetup", "captionsetup", "definecolor",
     "lstset", "lstdefinestyle", "pagestyle", "fancyhf", "fancyhead",
     "fancyfoot", "tcbset", "usetikzlibrary", "pgfplotsset",
     "sisetup", "DeclareSIUnit", "linespread",
@@ -1191,7 +1191,42 @@ def _unwrap_latex_cmd(content: str, tag: str, num_args: int, keep: int = -1, *, 
     return "".join(result)
 
 
-_HYPERREF_RE = re.compile(r"\\hyperref\[([^\]]*)\]\{([^}]*)\}")
+
+
+def _unwrap_hyperref_content(content: str) -> str:
+    result: list[str] = []
+    pos = 0
+    tag = r"\hyperref"
+    while True:
+        idx = content.find(tag, pos)
+        if idx == -1:
+            result.append(content[pos:])
+            return "".join(result)
+        after = idx + len(tag)
+        if after < len(content) and content[after].isalpha():
+            result.append(content[pos:after])
+            pos = after
+            continue
+        opt_start = after
+        while opt_start < len(content) and content[opt_start] in " \t\n\r":
+            opt_start += 1
+        if opt_start >= len(content) or content[opt_start] != "[":
+            result.append(content[pos:after])
+            pos = after
+            continue
+        opt_end = find_matching_bracket(content, opt_start)
+        if opt_end is None:
+            result.append(content[pos:after])
+            pos = after
+            continue
+        arg, end = extract_brace_arg(content, opt_end + 1)
+        if arg is None:
+            result.append(content[pos:after])
+            pos = after
+            continue
+        result.append(content[pos:idx])
+        result.append(arg)
+        pos = end
 
 
 def _preprocess_hyperref_content(content: str) -> str:
@@ -1203,7 +1238,9 @@ def _preprocess_hyperref_content(content: str) -> str:
         content = _unwrap_latex_cmd(content, "\\hypertarget", 2, keep=1)
     if "\\hyperlink" in content:
         content = _unwrap_latex_cmd(content, "\\hyperlink", 2, keep=1)
-    return _HYPERREF_RE.sub(r"\2", content)
+    if "\\hyperref" in content:
+        content = _unwrap_hyperref_content(content)
+    return content
 
 
 def preprocess_hyperref(paper_dir: Path) -> None:
@@ -1774,6 +1811,40 @@ def download(url: str, dest: Path) -> None:
     subprocess.run(["curl", "-L", url, "-o", str(dest)], check=True)
 
 
+
+def _iter_graphicspath_dirs(content: str) -> list[str]:
+    r"""Extract directories from LaTeX \graphicspath{{...}} declarations."""
+    dirs: list[str] = []
+    for _, _, arg in iter_latex_command_args(content, "graphicspath"):
+        pos = 0
+        while pos < len(arg):
+            path, pos = extract_brace_arg(arg, pos)
+            if path is None:
+                pos += 1
+                continue
+            path = path.strip()
+            if path and path not in dirs:
+                dirs.append(path.rstrip("/"))
+    return dirs
+
+
+def collect_graphicspath_dirs(paper_dir: Path) -> list[str]:
+    r"""Collect \graphicspath directories from TeX files for pandoc resources."""
+    dirs: list[str] = []
+    for tex in paper_dir.glob("**/*.tex"):
+        for path in _iter_graphicspath_dirs(tex.read_text(errors="replace")):
+            if path not in dirs:
+                dirs.append(path)
+    return dirs
+
+
+def _pandoc_resource_paths(cwd: Path) -> list[str]:
+    paths = [".", "figures", "images"]
+    for path in collect_graphicspath_dirs(cwd):
+        if path not in paths:
+            paths.append(path)
+    return paths
+
 def run_pandoc(
     main_tex: Path,
     output: Path,
@@ -1795,7 +1866,7 @@ def run_pandoc(
         "--standalone",
         "--toc",
         "--number-sections",
-        "--resource-path=.:figures:images",
+        f"--resource-path={':'.join(_pandoc_resource_paths(cwd))}",
         f"--css={SCRIPT_DIR / 'epub.css'}",
         f"--lua-filter={SCRIPT_DIR / 'filter.lua'}",
     ]
