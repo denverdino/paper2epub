@@ -331,6 +331,47 @@ class TestStripNoiseContent:
         text = "Just normal text"
         assert p._strip_noise_content(text) == text
 
+    def test_strips_notag(self):
+        result = p._strip_noise_content(r"x + y \notag\\")
+        assert "notag" not in result
+        assert r"x + y \\" in result
+
+    def test_strips_stepcounter(self):
+        result = p._strip_noise_content(r"\stepcounter{equation} text")
+        assert "stepcounter" not in result
+        assert "text" in result
+
+    def test_strips_csgdef(self):
+        result = p._strip_noise_content(r"\csgdef{mykey}{myval} text")
+        assert "csgdef" not in result
+        assert "text" in result
+
+    def test_strips_ccsxml_env(self):
+        content = (
+            "before\n"
+            "\\begin{CCSXML}\n<ccs2012>\n<concept>\n"
+            "<concept_id>10010147</concept_id>\n"
+            "</concept>\n</ccs2012>\n\\end{CCSXML}\n"
+            "after"
+        )
+        result = p._strip_noise_content(content)
+        assert "ccs2012" not in result
+        assert "CCSXML" not in result
+        assert "before" in result
+        assert "after" in result
+
+    def test_strips_ccsdesc(self):
+        content = r"\ccsdesc[500]{Computing methodologies~Machine learning}" + "\ntext"
+        result = p._strip_noise_content(content)
+        assert "ccsdesc" not in result
+        assert "text" in result
+
+    def test_strips_ccsdesc_no_optional(self):
+        content = r"\ccsdesc{Some description}" + "\ntext"
+        result = p._strip_noise_content(content)
+        assert "ccsdesc" not in result
+        assert "text" in result
+
 
 class TestNormalizeCitations:
     def test_citep(self):
@@ -351,6 +392,50 @@ class TestNormalizeCitations:
         assert result == original
 
 
+class TestStripAnnotationSystem:
+    def test_rewrites_atran_simple(self):
+        content = r"\newcommand{\atran}[2]{\overset{#2}{#1}}"
+        result = p._strip_annotation_system(content)
+        assert result == r"\newcommand{\atran}[2]{#1}"
+
+    def test_rewrites_atran_nested_braces(self):
+        content = r"\newcommand{\atran}[2]{\underset{#2}{\longrightarrow}}"
+        result = p._strip_annotation_system(content)
+        assert result == r"\newcommand{\atran}[2]{#1}"
+
+    def test_rewrites_atran_multiline(self):
+        content = (
+            "\\newcommand{\\atran}[2]{%\n"
+            "  \\stepcounter{cnt}%\n"
+            "  \\overset{\\text{(a)}}{#1}%\n"
+            "}"
+        )
+        result = p._strip_annotation_system(content)
+        assert result == r"\newcommand{\atran}[2]{#1}"
+
+    def test_strips_annotate_counter(self):
+        content = r"\newcounter{annotatecount}" "\n" r"\newcounter{annotateidx}" "\ntext"
+        result = p._strip_annotation_system(content)
+        assert "newcounter" not in result
+        assert "text" in result
+
+    def test_strips_annotate_helper_defs(self):
+        content = r"\newcommand{\annotateinitused}{\setcounter{x}{0}}" "\ntext"
+        result = p._strip_annotation_system(content)
+        assert "annotateinitused" not in result
+        assert "text" in result
+
+    def test_preserves_surrounding_content(self):
+        content = "before\n\\newcommand{\\atran}[2]{#1}\nafter"
+        result = p._strip_annotation_system(content)
+        assert "before" in result
+        assert "after" in result
+
+    def test_no_atran_passthrough(self):
+        content = "no annotation here"
+        assert p._strip_annotation_system(content) == content
+
+
 class TestPreprocessHyperref:
     def test_hyperref_unwrapped(self):
         result = p._preprocess_hyperref_content(r"\hyperref[sec:intro]{Introduction}")
@@ -364,6 +449,18 @@ class TestPreprocessHyperref:
         content = r"\hyperref[tab]{\texorpdfstring{$x$}{x} table}"
         result = p._preprocess_hyperref_content(content)
         assert "$x$ table" == result
+
+    def test_hy_raisedlink(self):
+        result = p._preprocess_hyperref_content(r"\Hy@raisedlink{\hypertarget{lbl}{}} text")
+        assert "Hy@raisedlink" not in result
+
+    def test_hypertarget(self):
+        result = p._preprocess_hyperref_content(r"\hypertarget{label}{visible text}")
+        assert result == "visible text"
+
+    def test_hyperlink(self):
+        result = p._preprocess_hyperref_content(r"\hyperlink{target}{click here}")
+        assert result == "click here"
 
 
 class TestNormalizeTableEnvs:
@@ -985,6 +1082,21 @@ class TestFilePreprocessing:
         result = tex.read_text()
         assert r"\begin{minipage}" not in result
         assert r"\includegraphics{img}" in result
+
+    def test_strip_at_col_specs_tabular(self):
+        content = r"\begin{tabular}{@{}p{0.3\columnwidth}p{0.3\columnwidth}@{}}"
+        result = p._strip_at_col_specs_content(content)
+        assert result == r"\begin{tabular}{p{0.3\columnwidth}p{0.3\columnwidth}}"
+
+    def test_strip_at_col_specs_multicolumn(self):
+        content = r"\multicolumn{3}{@{}l}{\textit{Group}}"
+        result = p._strip_at_col_specs_content(content)
+        assert result == r"\multicolumn{3}{l}{\textit{Group}}"
+
+    def test_strip_at_col_specs_no_change(self):
+        content = r"\begin{tabular}{lll}"
+        result = p._strip_at_col_specs_content(content)
+        assert result == content
 
     def test_normalize_code_listings(self, tmp_path):
         tex = tmp_path / "paper.tex"

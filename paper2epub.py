@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
+from collections.abc import Callable
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -926,20 +927,24 @@ _NOISE_NO_ARG_RE = re.compile(
     r"|allowbreak|linebreak|pagebreak"
     r"|newpage|clearpage|cleardoublepage"
     r"|centering|tableofcontents|FloatBarrier"
-    r"|maketitle)\b\s*"
+    r"|maketitle|notag)\b\s*"
 )
+
+_CCSDESC_RE = re.compile(r"\\ccsdesc\s*(?:\[[^\]]*\])?\s*\{[^}]*\}\s*")
 
 _NOISE_ONE_ARG = [
     "vspace", "hspace", "enlargethispage",
     "phantom", "vphantom", "hphantom",
     "todo", "fixme", "marginpar",
+    "stepcounter",
 ]
 
 _NOISE_TWO_ARG = [
     "setlength", "addtolength", "setcounter", "addtocounter",
+    "csgdef",
 ]
 
-_STRIP_ENVS = {"tikzpicture", "comment"}
+_STRIP_ENVS = {"tikzpicture", "comment", "CCSXML"}
 
 _STRIP_ENV_RE = re.compile(
     r"\\begin\{(" + "|".join(_STRIP_ENVS) + r")\}.*?\\end\{\1\}",
@@ -949,6 +954,7 @@ _STRIP_ENV_RE = re.compile(
 
 def _strip_noise_content(content: str) -> str:
     content = _NOISE_NO_ARG_RE.sub("", content)
+    content = _CCSDESC_RE.sub("", content)
     content = content.replace(r"\today", datetime.date.today().strftime("%B %d, %Y"))
 
     for cmd in _NOISE_ONE_ARG:
@@ -978,6 +984,70 @@ def _strip_noise_content(content: str) -> str:
 
 def strip_noise_commands(paper_dir: Path) -> None:
     _transform_tex_files(paper_dir, _strip_noise_content, "Stripped noise commands")
+
+
+# ---------------------------------------------------------------------------
+# Annotation system stripping (e.g. \atran, \aeq, \annotate)
+# ---------------------------------------------------------------------------
+
+_ATRAN_TAG = r"\newcommand{\atran}"
+
+_ANNOTATE_DEF_RE = re.compile(
+    r"\\(?:newcommand|renewcommand)\{"
+    r"\\(?:annotate(?:hypertarget|initused|getlabels|printlabels)?)\b"
+)
+
+_ANNOTATE_COUNTER_RE = re.compile(
+    r"\\newcounter\{annotate\w*\}\s*",
+)
+
+
+def _strip_newcommand_block(content: str, start: int) -> tuple[int, int]:
+    """Return (start_of_block, end_of_block) for a \\newcommand at *start*."""
+    i = start
+    while i < len(content) and content[i] != "{":
+        i += 1
+    end = find_matching_brace(content, i)
+    if end is None:
+        return start, start
+    i = end + 1
+    while i < len(content) and content[i] in " \t":
+        i += 1
+    if i < len(content) and content[i] == "[":
+        while i < len(content) and content[i] != "]":
+            i += 1
+        i += 1
+    while i < len(content) and content[i] in " \t":
+        i += 1
+    if i < len(content) and content[i] == "{":
+        end = find_matching_brace(content, i)
+        if end is not None:
+            return start, end + 1
+    return start, start
+
+
+def _strip_annotation_system(content: str) -> str:
+    tag = _ATRAN_TAG
+    idx = content.find(tag)
+    if idx != -1:
+        _, block_end = _strip_newcommand_block(content, idx)
+        if block_end > idx:
+            content = content[:idx] + r"\newcommand{\atran}[2]{#1}" + content[block_end:]
+
+    for m in reversed(list(_ANNOTATE_DEF_RE.finditer(content))):
+        _, block_end = _strip_newcommand_block(content, m.start())
+        if block_end > m.start():
+            content = content[:m.start()] + content[block_end:]
+
+    content = _ANNOTATE_COUNTER_RE.sub("", content)
+    return content
+
+
+def strip_annotation_system(paper_dir: Path) -> None:
+    _transform_tex_files(
+        paper_dir, _strip_annotation_system, "Stripped annotation system",
+        guard="\\atran",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1113,12 @@ _HYPERREF_RE = re.compile(r"\\hyperref\[([^\]]*)\]\{([^}]*)\}")
 def _preprocess_hyperref_content(content: str) -> str:
     if "\\texorpdfstring" in content:
         content = _unwrap_latex_cmd(content, "\\texorpdfstring", 2, keep=0)
+    if "\\Hy@raisedlink" in content:
+        content = _unwrap_latex_cmd(content, "\\Hy@raisedlink", 1, keep=0)
+    if "\\hypertarget" in content:
+        content = _unwrap_latex_cmd(content, "\\hypertarget", 2, keep=1)
+    if "\\hyperlink" in content:
+        content = _unwrap_latex_cmd(content, "\\hyperlink", 2, keep=1)
     return _HYPERREF_RE.sub(r"\2", content)
 
 
@@ -1392,17 +1468,40 @@ def convert_pdf_images(paper_dir: Path) -> None:
             print(f"Warning: could not convert {pdf_path}: {e}", file=sys.stderr)
 
 
-def _normalize_siunitx_content(content: str) -> str:
-    for m in reversed(list(re.finditer(r"\\begin\{tabular[*x]?\}\s*", content))):
+def _transform_col_specs(content: str, pattern: str, transform: Callable[[str], str]) -> str:
+    for m in reversed(list(re.finditer(pattern, content))):
         brace_start = m.end()
         brace_end = find_matching_brace(content, brace_start)
         if brace_end is None:
             continue
         spec = content[brace_start + 1 : brace_end]
-        new_spec = re.sub(r"S\s*(?:\[[^\]]*\])?", "r", spec)
+        new_spec = transform(spec)
         if new_spec != spec:
             content = content[: brace_start + 1] + new_spec + content[brace_end:]
     return content
+
+
+_AT_COL_SPEC_RE = re.compile(r"@\{[^}]*\}")
+_TABULAR_RE = r"\\begin\{tabular[*x]?\}\s*"
+_MULTICOLUMN_RE = r"\\multicolumn\{[^}]*\}\s*"
+
+
+def _strip_at_col_specs_content(content: str) -> str:
+    strip = _AT_COL_SPEC_RE.sub
+    content = _transform_col_specs(content, _TABULAR_RE, lambda s: strip("", s))
+    content = _transform_col_specs(content, _MULTICOLUMN_RE, lambda s: strip("", s))
+    return content
+
+
+def strip_at_col_specs(paper_dir: Path) -> None:
+    _transform_tex_files(paper_dir, _strip_at_col_specs_content, "Stripped @{} column specs", guard="@{")
+
+
+_SIUNITX_COL_RE = re.compile(r"S\s*(?:\[[^\]]*\])?")
+
+
+def _normalize_siunitx_content(content: str) -> str:
+    return _transform_col_specs(content, _TABULAR_RE, lambda s: _SIUNITX_COL_RE.sub("r", s))
 
 
 def normalize_siunitx_columns(paper_dir: Path) -> None:
@@ -1702,6 +1801,7 @@ def main():
     simplify_documentclass(main_tex)
     strip_problematic_packages(paper_dir)
     strip_noise_commands(paper_dir)
+    strip_annotation_system(paper_dir)
     normalize_textsc(paper_dir)
 
     macros = collect_macros(paper_dir)
@@ -1719,6 +1819,7 @@ def main():
     normalize_table_envs(paper_dir)
     unwrap_makecell(paper_dir)
     strip_minipage_in_tables(paper_dir)
+    strip_at_col_specs(paper_dir)
     normalize_siunitx_columns(paper_dir)
     strip_resizebox(paper_dir)
     strip_adjustbox(paper_dir)
