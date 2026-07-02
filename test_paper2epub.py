@@ -1197,3 +1197,36 @@ class TestStripMinipageInTables:
         result = p._strip_minipage_in_tables_content(content)
         assert r"\begin{minipage}" not in result
         assert "content" in result
+
+
+class TestArxivCompatibilityHelpers:
+    def test_strip_tex_comments_preserves_escaped_percent(self):
+        assert p.strip_tex_comments(r"100\% ok % comment") == r"100\% ok "
+
+    def test_get_input_order_relative_to_nested_file(self, tmp_path):
+        sections = tmp_path / "sections"
+        sections.mkdir()
+        (sections / "intro.tex").write_text(r"\input{detail}")
+        (sections / "detail.tex").write_text("details")
+        main = tmp_path / "main.tex"
+        main.write_text(r"\input{sections/intro}")
+        result = p.get_input_order(main)
+        assert [path.name for path in result] == ["main.tex", "intro.tex", "detail.tex"]
+
+    def test_find_main_tex_searches_subdirectories(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        main = src / "paper.tex"
+        main.write_text(r"\documentclass{article}")
+        assert p.find_main_tex(tmp_path) == main
+
+    def test_simplify_documentclass_without_options(self, tmp_path):
+        tex = tmp_path / "main.tex"
+        tex.write_text(r"\documentclass{IEEEtran}")
+        p.simplify_documentclass(tex)
+        assert tex.read_text() == r"\documentclass{article}"
+
+    def test_rewrite_pdf_image_refs_keeps_options(self):
+        content = r"\includegraphics[width=.8\linewidth]{figs/plot.pdf}"
+        result = p._rewrite_pdf_image_refs_content(content)
+        assert result == r"\includegraphics[width=.8\linewidth]{figs/plot.png}"
