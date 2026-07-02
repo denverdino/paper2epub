@@ -29,14 +29,17 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-ALGO_CMDS = re.compile(
-    r"\\(Require|Ensure|State|For|EndFor|ForAll|"
-    r"If|ElsIf|Else|EndIf|"
-    r"While|EndWhile|"
-    r"Repeat|Until|"
-    r"Loop|EndLoop|"
-    r"Return|Print)\b"
+_ALGO_CMD_NAMES = (
+    "Require", "Ensure", "State", "For", "EndFor", "ForAll",
+    "If", "ElsIf", "Else", "EndIf",
+    "While", "EndWhile", "Repeat", "Until",
+    "Loop", "EndLoop", "Return", "Print",
 )
+ALGO_CMDS = re.compile(
+    r"\\(" + "|".join(_ALGO_CMD_NAMES) + r")\b",
+    re.IGNORECASE,
+)
+_ALGO_CANONICAL = {name.lower(): name for name in _ALGO_CMD_NAMES}
 NEEDS_BRACE_ARG = {"For", "ForAll", "If", "ElsIf", "While", "Until"}
 INDENT_OPEN = {"For", "ForAll", "If", "While", "Loop", "Repeat"}
 INDENT_CLOSE_BEFORE = {
@@ -388,7 +391,7 @@ def parse_algorithmic(content):
     line_num = 1
 
     for idx, match in enumerate(matches):
-        cmd = match.group(1)
+        cmd = _ALGO_CANONICAL[match.group(1).lower()]
         pos = match.end()
 
         if cmd in NEEDS_BRACE_ARG:
@@ -1763,7 +1766,7 @@ def normalize_textsc(paper_dir: Path) -> None:
 def preprocess_algorithms(paper_dir: Path) -> None:
     _transform_tex_files(
         paper_dir, process_algorithms, "Preprocessed algorithms",
-        guard="\\begin{algorithm", glob="*.tex",
+        guard="\\begin{algorithm",
     )
 
 
