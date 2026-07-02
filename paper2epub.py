@@ -93,7 +93,7 @@ def expand_macros(text: str, macros: dict[str, str], depth: int = 5) -> str:
 
 
 def _read_and_strip_comments(tex_path: Path) -> str:
-    return re.sub(r"%.*", "", tex_path.read_text(errors="replace"))
+    return strip_tex_comments(tex_path.read_text(errors="replace"))
 
 
 def extract_title(main_tex: Path, macros: dict[str, str], _content: str | None = None) -> str | None:
@@ -158,8 +158,16 @@ def extract_authors(main_tex: Path, macros: dict[str, str], _content: str | None
 # ---------------------------------------------------------------------------
 
 
+def _resolve_tex_include(current_tex: Path, name: str) -> Path | None:
+    candidates = [name] if name.endswith(".tex") else [name, f"{name}.tex"]
+    for candidate in candidates:
+        path = (current_tex.parent / candidate).resolve()
+        if path.exists():
+            return path
+    return None
+
+
 def get_input_order(main_tex: Path) -> list[Path]:
-    root = main_tex.parent
     visited: set[Path] = set()
     result: list[Path] = []
 
@@ -169,14 +177,16 @@ def get_input_order(main_tex: Path) -> list[Path]:
             return
         visited.add(resolved)
         result.append(tex)
-        text = tex.read_text(errors="replace")
-        for m in re.finditer(r"\\(?:input|include)\{([^}]+)\}", text):
-            name = m.group(1)
-            if not name.endswith(".tex"):
-                name += ".tex"
-            p = root / name
-            if p.exists():
-                _walk(p)
+        text = strip_tex_comments(tex.read_text(errors="replace"))
+        includes = sorted(
+            list(iter_latex_command_args(text, "input", optional=False))
+            + list(iter_latex_command_args(text, "include", optional=False)),
+            key=lambda item: item[0],
+        )
+        for _, _, name in includes:
+            child = _resolve_tex_include(tex, name.strip())
+            if child is not None:
+                _walk(child)
 
     _walk(main_tex)
     return result
@@ -233,6 +243,79 @@ def extract_brace_arg(text, pos):
     if end is None:
         return None, pos
     return text[pos + 1 : end], end + 1
+
+
+def find_matching_bracket(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] != "[":
+        return None
+    depth = 0
+    i = start
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def skip_latex_options(text: str, pos: int) -> int:
+    while True:
+        while pos < len(text) and text[pos] in " \t\n\r":
+            pos += 1
+        if pos >= len(text) or text[pos] != "[":
+            return pos
+        end = find_matching_bracket(text, pos)
+        if end is None:
+            return pos
+        pos = end + 1
+
+
+def iter_latex_command_args(content: str, command: str, *, optional: bool = True):
+    tag = f"\\{command}"
+    i = 0
+    while True:
+        idx = content.find(tag, i)
+        if idx == -1:
+            return
+        after = idx + len(tag)
+        if after < len(content) and content[after].isalpha():
+            i = after
+            continue
+        pos = skip_latex_options(content, after) if optional else after
+        arg, end = extract_brace_arg(content, pos)
+        if arg is not None:
+            yield idx, end, arg
+            i = end
+        else:
+            i = after
+
+
+def strip_tex_comments(content: str) -> str:
+    lines = []
+    for line in content.splitlines(keepends=True):
+        i = 0
+        while True:
+            i = line.find("%", i)
+            if i == -1:
+                lines.append(line)
+                break
+            backslashes = 0
+            j = i - 1
+            while j >= 0 and line[j] == "\\":
+                backslashes += 1
+                j -= 1
+            if backslashes % 2 == 0:
+                newline = "\n" if line.endswith("\n") else ""
+                lines.append(line[:i] + newline)
+                break
+            i += 1
+    return "".join(lines)
 
 
 def replace_call_in_text(text):
@@ -826,12 +909,12 @@ def translate_tex_files(
 
 
 def find_main_tex(paper_dir: Path) -> Path:
-    for tex in paper_dir.glob("*.tex"):
-        content = tex.read_text(errors="replace")
+    for tex in paper_dir.rglob("*.tex"):
+        content = strip_tex_comments(tex.read_text(errors="replace"))
         if re.search(r"\\documentclass|\\begin\{document\}", content):
             return tex
 
-    texfiles = list(paper_dir.glob("*.tex"))
+    texfiles = list(paper_dir.rglob("*.tex"))
     if texfiles:
         return texfiles[0]
 
@@ -841,11 +924,9 @@ def find_main_tex(paper_dir: Path) -> Path:
 
 def simplify_documentclass(tex_path: Path) -> None:
     content = tex_path.read_text()
-    updated = re.sub(
-        r"\\documentclass\[[^\]]*\]\{[^}]*\}",
-        r"\\documentclass{article}",
-        content,
-    )
+    updated = content
+    for start, end, _ in reversed(list(iter_latex_command_args(content, "documentclass"))):
+        updated = updated[:start] + r"\documentclass{article}" + updated[end:]
     updated = re.sub(r"^\s*\\maketitle\s*$", "", updated, flags=re.MULTILINE)
     if updated != content:
         tex_path.write_text(updated)
@@ -1468,6 +1549,30 @@ def convert_pdf_images(paper_dir: Path) -> None:
             print(f"Warning: could not convert {pdf_path}: {e}", file=sys.stderr)
 
 
+
+
+def _rewrite_pdf_image_refs_content(content: str) -> str:
+    result: list[str] = []
+    pos = 0
+    for start, end, path in iter_latex_command_args(content, "includegraphics"):
+        result.append(content[pos:start])
+        if path.lower().endswith(".pdf"):
+            rewritten = content[start:end - len(path) - 1] + path[:-4] + ".png}"
+            result.append(rewritten)
+        else:
+            result.append(content[start:end])
+        pos = end
+    result.append(content[pos:])
+    return "".join(result)
+
+
+def rewrite_pdf_image_refs(paper_dir: Path) -> None:
+    _transform_tex_files(
+        paper_dir, _rewrite_pdf_image_refs_content, "Rewrote PDF image refs",
+        guard="\\includegraphics",
+    )
+
+
 def _transform_col_specs(content: str, pattern: str, transform: Callable[[str], str]) -> str:
     for m in reversed(list(re.finditer(pattern, content))):
         brace_start = m.end()
@@ -1667,11 +1772,18 @@ def download(url: str, dest: Path) -> None:
 
 
 def run_pandoc(
-    main_tex: Path, output: Path, title: str | None, authors: list[str] | None = None
+    main_tex: Path,
+    output: Path,
+    title: str | None,
+    authors: list[str] | None = None,
+    *,
+    workdir: Path | None = None,
 ) -> None:
+    cwd = workdir or main_tex.parent
+    input_path = os.path.relpath(main_tex, cwd)
     args = [
         "pandoc",
-        str(main_tex.name),
+        input_path,
         "--mathml",
         "--from",
         "latex",
@@ -1691,7 +1803,7 @@ def run_pandoc(
             args += ["--metadata", f"author={author}"]
     args += ["-o", str(output)]
 
-    subprocess.run(args, cwd=main_tex.parent, check=True)
+    subprocess.run(args, cwd=cwd, check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +1926,7 @@ def main():
         print(f"Authors: {', '.join(authors)}")
 
     convert_pdf_images(paper_dir)
+    rewrite_pdf_image_refs(paper_dir)
     normalize_citations(paper_dir)
     preprocess_hyperref(paper_dir)
     normalize_table_envs(paper_dir)
@@ -1839,7 +1952,7 @@ def main():
 
     suffix = "-zh" if args.translate else ""
     output = Path.cwd() / f"{arxiv_id}{suffix}.epub"
-    run_pandoc(main_tex, output, title, authors)
+    run_pandoc(main_tex, output, title, authors, workdir=paper_dir)
     print(f"Generated: {output}")
 
     if args.email:
