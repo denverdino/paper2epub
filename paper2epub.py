@@ -14,7 +14,7 @@
 
 import argparse
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import os
 import re
@@ -141,7 +141,25 @@ class LatexDocument:
         except LatexWalkerParseError as exc:
             nodes = []
             self.parse_warnings = (str(exc),)
-        self._refs = tuple(self._walk(nodes, parent_environment=None))
+        refs = tuple(self._walk(nodes, parent_environment=None))
+        self._refs = self._propagate_opaque_ranges(refs)
+
+    @staticmethod
+    def _propagate_opaque_ranges(
+        refs: tuple[LatexNodeRef, ...],
+    ) -> tuple[LatexNodeRef, ...]:
+        opaque_ranges = tuple(
+            (ref.start, ref.end) for ref in refs if ref.opaque
+        )
+        return tuple(
+            replace(ref, opaque=True)
+            if not ref.opaque and any(
+                start <= ref.start and ref.end <= end
+                for start, end in opaque_ranges
+            )
+            else ref
+            for ref in refs
+        )
 
     def _walk(
         self,
@@ -1290,6 +1308,8 @@ def plan_simplify_documentclass(
                 safety=Safety.SAFE,
             ))
     for ref in document.commands("maketitle"):
+        if not ref.complete or ref.opaque:
+            continue
         start, end = _whole_line_range_if_alone(
             source.content,
             ref.start,

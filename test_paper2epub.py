@@ -133,6 +133,32 @@ class TestLatexDocument:
         assert image.complete is False
         assert image.opaque is True
 
+    def test_nested_command_in_incomplete_group_inherits_opaque(self, tmp_path):
+        content = r"\section{before \textbf{nested}"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        section = document.commands("section")[0]
+        bold = document.commands("textbf")[0]
+
+        assert section.opaque is True
+        assert bold.complete is True
+        assert bold.opaque is True
+
+    def test_node_after_malformed_optional_group_inherits_opaque(self, tmp_path):
+        content = "\\documentclass[12pt\n\\maketitle\nBody"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        documentclass = document.commands("documentclass")[0]
+        maketitle = document.commands("maketitle")[0]
+
+        assert documentclass.opaque is True
+        assert maketitle.complete is True
+        assert maketitle.opaque is True
+
     def test_starred_section_preserves_full_source_and_required_title(self, tmp_path):
         content = r"\section*{Long}"
         document = p.LatexDocument(p.SourceFile(tmp_path / "main.tex", content))
@@ -1179,6 +1205,24 @@ class TestPlanSimplifyDocumentclass:
         ids=["incomplete-required", "incomplete-optional", "missing-required"],
     )
     def test_malformed_documentclass_is_preserved(self, tmp_path, content):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        edits = p.plan_simplify_documentclass(source, p.LatexDocument(source))
+
+        assert edits == []
+        assert p.EditPlanner.apply(source, edits) == content
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "\\documentclass{IEEEtran\n\\maketitle\nBody",
+            "\\documentclass[12pt\n\\maketitle\nBody",
+        ],
+        ids=["required-contains-maketitle", "optional-precedes-maketitle"],
+    )
+    def test_maketitle_in_opaque_documentclass_is_preserved(
+        self, tmp_path, content,
+    ):
         source = p.SourceFile(tmp_path / "main.tex", content)
 
         edits = p.plan_simplify_documentclass(source, p.LatexDocument(source))
