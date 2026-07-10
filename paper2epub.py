@@ -58,7 +58,8 @@ class SourceFile:
 
     @classmethod
     def from_path(cls, path: Path) -> "SourceFile":
-        return cls(path=path, content=path.read_text(errors="replace"))
+        with path.open(encoding="utf-8", errors="replace", newline="") as stream:
+            return cls(path=path, content=stream.read())
 
 
 @dataclass(frozen=True)

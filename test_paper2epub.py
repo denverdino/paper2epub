@@ -1,5 +1,8 @@
 """Unit tests for paper2epub.py — pure-function coverage, no network/API calls."""
 
+import shutil
+import subprocess
+
 import pytest
 from pathlib import Path
 
@@ -1465,6 +1468,14 @@ class TestUnnumberParagraphHeadings:
 
         assert tex.read_text() == r"\paragraph*{Contributions.} Body"
 
+    def test_preserves_crlf_line_endings(self, tmp_path):
+        tex = tmp_path / "main.tex"
+        tex.write_bytes(b"before\r\n\\paragraph{Title}\r\nafter\r\n")
+
+        p.unnumber_paragraph_headings(tmp_path)
+
+        assert tex.read_bytes() == b"before\r\n\\paragraph*{Title}\r\nafter\r\n"
+
 
 class TestParagraphUnnumberingPipeline:
     def test_runs_after_translation_and_before_input_normalization(self):
@@ -1476,6 +1487,26 @@ class TestParagraphUnnumberingPipeline:
             < main_source.index("unnumber_paragraph_headings(")
             < main_source.index("normalize_input_extensions(")
         )
+
+    @pytest.mark.skipif(shutil.which("pandoc") is None, reason="pandoc not installed")
+    def test_pandoc_numbers_section_but_not_paragraph(self, tmp_path):
+        content = r"\section{Numbered}" + "\n" + r"\paragraph{Unnumbered}" + "\nBody"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        transformed = p.EditPlanner.apply(
+            source,
+            p.plan_unnumber_paragraphs(source, p.LatexDocument(source)),
+        )
+
+        result = subprocess.run(
+            ["pandoc", "--from=latex", "--to=html5", "--number-sections"],
+            input=transformed,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        assert result.stdout.count("header-section-number") == 1
+        assert '<h4 class="unnumbered"' in result.stdout
 
 
 # ── get_input_order ─────────────────────────────────────────────────────────
