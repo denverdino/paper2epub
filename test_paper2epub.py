@@ -30,6 +30,58 @@ class TestSourceAndEditTypes:
             edit.start = 1
 
 
+class TestLatexDocument:
+    def test_finds_nested_commands_with_source_ranges(self, tmp_path):
+        content = r"Before \section{A \textbf{nested} title} after"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        document = p.LatexDocument(source)
+
+        section = document.commands("section")[0]
+        bold = document.commands("textbf")[0]
+        assert document.source_text(section) == r"\section{A \textbf{nested} title}"
+        assert document.argument_text(section, 0) == r"A \textbf{nested} title"
+        assert document.argument_text(bold, 0) == "nested"
+        assert section.start < bold.start < bold.end <= section.end
+
+    def test_finds_environment_and_parent(self, tmp_path):
+        content = (
+            r"\begin{figure}"
+            r"\includegraphics[width=.8\linewidth]{figs/a.pdf}"
+            r"\end{figure}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        document = p.LatexDocument(source)
+
+        figure = document.environments("figure")[0]
+        image = document.commands("includegraphics")[0]
+        assert document.source_text(figure) == content
+        assert image.parent_environment == "figure"
+        assert document.argument_text(image, 0) == r"width=.8\linewidth"
+        assert document.argument_text(image, 1) == "figs/a.pdf"
+
+    def test_missing_optional_argument_returns_none(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\includegraphics{figs/a.pdf}",
+        )
+
+        document = p.LatexDocument(source)
+        image = document.commands("includegraphics")[0]
+
+        assert document.argument_text(image, 0) is None
+        assert document.argument_text(image, 1) == "figs/a.pdf"
+
+    def test_incomplete_input_is_tolerated(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", r"text \section{unfinished")
+
+        document = p.LatexDocument(source)
+
+        assert isinstance(document.parse_warnings, tuple)
+        assert document.source.content == r"text \section{unfinished"
+
+
 # ── Brace matching ──────────────────────────────────────────────────────────
 
 

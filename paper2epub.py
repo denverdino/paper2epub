@@ -28,7 +28,19 @@ import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
+from typing import Any, Iterable
+
+from pylatexenc.latexwalker import (
+    LatexEnvironmentNode,
+    LatexGroupNode,
+    LatexMacroNode,
+    LatexWalker,
+    LatexWalkerParseError,
+    get_default_latex_context_db,
+)
+from pylatexenc.macrospec import MacroSpec, MacroStandardArgsParser
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -57,6 +69,128 @@ class Edit:
     replacement: str
     pass_name: str
     safety: Safety
+
+
+_PARSER_MACRO_ARGS = {
+    "documentclass": "[{",
+    "include": "{",
+    "includegraphics": "[{",
+    "input": "{",
+    "maketitle": "",
+    "RequirePackage": "[{",
+    "section": "{",
+    "usepackage": "[{",
+}
+
+
+@cache
+def _build_latex_context():
+    context = get_default_latex_context_db()
+    context.add_context_category(
+        "paper2epub",
+        macros=[
+            MacroSpec(name, MacroStandardArgsParser(argspec))
+            for name, argspec in _PARSER_MACRO_ARGS.items()
+        ],
+        prepend=True,
+    )
+    return context
+
+
+@dataclass(frozen=True)
+class LatexNodeRef:
+    file: Path
+    node: Any
+    kind: str
+    name: str
+    start: int
+    end: int
+    parent_environment: str | None
+
+
+class LatexDocument:
+    def __init__(self, source: SourceFile):
+        self.source = source
+        self.parse_warnings: tuple[str, ...] = ()
+        try:
+            walker = LatexWalker(
+                source.content,
+                latex_context=_build_latex_context(),
+                tolerant_parsing=True,
+            )
+            nodes, _, _ = walker.get_latex_nodes(pos=0)
+        except LatexWalkerParseError as exc:
+            nodes = []
+            self.parse_warnings = (str(exc),)
+        self._refs = tuple(self._walk(nodes, parent_environment=None))
+
+    def _walk(
+        self,
+        nodes: Iterable[Any],
+        parent_environment: str | None,
+    ) -> Iterable[LatexNodeRef]:
+        for node in nodes:
+            child_parent = parent_environment
+            if isinstance(node, LatexMacroNode):
+                yield LatexNodeRef(
+                    self.source.path,
+                    node,
+                    "command",
+                    node.macroname,
+                    node.pos,
+                    node.pos + node.len,
+                    parent_environment,
+                )
+            elif isinstance(node, LatexEnvironmentNode):
+                child_parent = node.environmentname
+                yield LatexNodeRef(
+                    self.source.path,
+                    node,
+                    "environment",
+                    node.environmentname,
+                    node.pos,
+                    node.pos + node.len,
+                    parent_environment,
+                )
+
+            nodeargd = getattr(node, "nodeargd", None)
+            if nodeargd is not None:
+                for argument in nodeargd.argnlist:
+                    if argument is not None:
+                        yield from self._walk((argument,), child_parent)
+
+            children = getattr(node, "nodelist", None)
+            if children:
+                yield from self._walk(children, child_parent)
+
+    def commands(self, name: str) -> list[LatexNodeRef]:
+        return [
+            ref for ref in self._refs
+            if ref.kind == "command" and ref.name == name
+        ]
+
+    def environments(self, name: str) -> list[LatexNodeRef]:
+        return [
+            ref for ref in self._refs
+            if ref.kind == "environment" and ref.name == name
+        ]
+
+    def source_text(self, ref: LatexNodeRef) -> str:
+        return self.source.content[ref.start:ref.end]
+
+    def argument_text(self, ref: LatexNodeRef, index: int) -> str | None:
+        nodeargd = getattr(ref.node, "nodeargd", None)
+        if nodeargd is None or index >= len(nodeargd.argnlist):
+            return None
+        argument = nodeargd.argnlist[index]
+        if argument is None:
+            return None
+        text = self.source.content[argument.pos:argument.pos + argument.len]
+        if isinstance(argument, LatexGroupNode):
+            opening, closing = argument.delimiters
+            if opening is not None and closing is not None:
+                return text[len(opening):-len(closing)]
+        return text
 
 
 _ALGO_CMD_NAMES = (
