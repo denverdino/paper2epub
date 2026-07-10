@@ -986,6 +986,28 @@ def _filter_usepackage(m: re.Match) -> str:
     return m.group(0).replace(m.group(1), ", ".join(remaining))
 
 
+_AT_CMD_RE = re.compile(
+    r"\\(?:newcommand|renewcommand|providecommand|DeclareRobustCommand)"
+    r"\s*\{\\[a-zA-Z]*@[a-zA-Z@]*\}"
+    r"(?:\s*\[\d+\])?"
+    r"\s*\{",
+)
+
+
+def _strip_at_commands(content: str) -> str:
+    """Strip \\newcommand/\\renewcommand targeting internal @-commands."""
+    while True:
+        m = _AT_CMD_RE.search(content)
+        if not m:
+            break
+        brace_pos = m.end() - 1
+        end = find_matching_brace(content, brace_pos)
+        if end is None:
+            break
+        content = content[: m.start()] + content[end + 1 :]
+    return content
+
+
 def _strip_problematic_packages_content(content: str) -> str:
     content = _USEPACKAGE_RE.sub(_filter_usepackage, content)
 
@@ -998,6 +1020,9 @@ def _strip_problematic_packages_content(content: str) -> str:
     content = re.sub(
         r"^\s*\\(?:makeatletter|makeatother)\s*$", "", content, flags=re.MULTILINE
     )
+
+    content = _strip_at_commands(content)
+
     return content
 
 
@@ -1828,6 +1853,26 @@ def _iter_graphicspath_dirs(content: str) -> list[str]:
     return dirs
 
 
+def normalize_input_extensions(paper_dir: Path) -> None:
+    r"""Append .tex to \input/\include args so Pandoc 3.x can resolve them."""
+
+    def _add_tex_ext(content: str) -> str:
+        for cmd in ("input", "include"):
+            shifts = 0
+            for start, end, arg in list(iter_latex_command_args(content, cmd, optional=False)):
+                arg = arg.strip()
+                if arg.endswith(".tex"):
+                    continue
+                if not (paper_dir / f"{arg}.tex").exists():
+                    continue
+                new_cmd = f"\\{cmd}{{{arg}.tex}}"
+                content = content[: start + shifts] + new_cmd + content[end + shifts :]
+                shifts += len(new_cmd) - (end - start)
+        return content
+
+    _transform_tex_files(paper_dir, _add_tex_ext, "Normalized input extensions")
+
+
 def collect_graphicspath_dirs(paper_dir: Path) -> list[str]:
     r"""Collect \graphicspath directories from TeX files for pandoc resources."""
     dirs: list[str] = []
@@ -2023,6 +2068,8 @@ def main():
     if args.translate:
         client = create_openai_client()
         translate_tex_files(paper_dir, main_tex, client, title)
+
+    normalize_input_extensions(paper_dir)
 
     suffix = "-zh" if args.translate else ""
     output = Path.cwd() / f"{arxiv_id}{suffix}.epub"
