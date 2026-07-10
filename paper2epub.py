@@ -77,6 +77,7 @@ _PARSER_MACRO_ARGS = {
     "includegraphics": "[{",
     "input": "{",
     "maketitle": "",
+    "paragraph": "*[{",
     "RequirePackage": "[{",
     "section": "*[{",
     "subsection": "*[{",
@@ -85,6 +86,7 @@ _PARSER_MACRO_ARGS = {
 }
 
 _PARSER_ARGUMENT_INDEXES = {
+    "paragraph": (2,),
     "section": (2,),
     "subsection": (2,),
     "subsubsection": (2,),
@@ -921,7 +923,7 @@ PURE_CMD_LINE = re.compile(
 )
 
 SECTION_HEADING_LINE_RE = re.compile(
-    r"^\s*\\(?:section|subsection|subsubsection)\*?(?:\[[^\]]*\])?\{",
+    r"^\s*\\(?:section|subsection|subsubsection|paragraph)\*?(?:\[[^\]]*\])?\{",
     re.MULTILINE,
 )
 
@@ -984,7 +986,12 @@ def extract_section_headings(tex_files: list[Path]) -> list[str]:
         refs = sorted(
             (
                 ref
-                for name in ("section", "subsection", "subsubsection")
+                for name in (
+                    "section",
+                    "subsection",
+                    "subsubsection",
+                    "paragraph",
+                )
                 for ref in document.commands(name)
             ),
             key=lambda ref: ref.start,
@@ -1208,7 +1215,7 @@ def _build_heading_translations(
 
 def _translate_headings(heading_translations: dict[str, str], content: str) -> str:
     heading_re = re.compile(
-        r"\\(?:section|subsection|subsubsection)\*?(?:\[[^\]]*\])?\{"
+        r"\\(?:section|subsection|subsubsection|paragraph)\*?(?:\[[^\]]*\])?\{"
     )
     headings = []
     for m in heading_re.finditer(content):

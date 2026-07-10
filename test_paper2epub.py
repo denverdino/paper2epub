@@ -938,6 +938,39 @@ class TestExtractSectionHeadings:
 
         assert p.extract_section_headings([tex]) == [r"About \textbf{Method}"]
 
+    def test_includes_paragraph_with_nested_title(self, tmp_path):
+        tex = tmp_path / "section.tex"
+        tex.write_text(r"\paragraph[Short]{About \textbf{Method}}")
+
+        assert p.extract_section_headings([tex]) == [r"About \textbf{Method}"]
+
+
+class TestTranslateHeadings:
+    def test_paragraph_translation_is_plain_text(self):
+        content = r"\paragraph{Contributions.}\label{para:contrib}" + "\nBody."
+
+        result = p._translate_headings({"Contributions.": "贡献。"}, content)
+
+        assert result.count(r"\paragraph") == 1
+        assert r"\paragraph{贡献。}" not in result
+        assert r"\label{para:contrib}" + "\n\n贡献。\n" in result
+
+
+class TestTranslateFileContent:
+    def test_paragraph_heading_is_not_duplicated(self, monkeypatch):
+        content = r"\paragraph{Contributions.}" + "\nBody text with enough prose."
+        monkeypatch.setattr(
+            p, "_batch_translate", lambda client, glossary, numbered: {0: "正文。"}
+        )
+
+        result = p.translate_file_content(
+            object(), "", {"Contributions.": "贡献。"}, content
+        )
+
+        assert result.count(r"\paragraph") == 1
+        assert r"\paragraph{贡献。}" not in result
+        assert "贡献。" in result
+
 
 class TestTranslateTexFiles:
     def test_translates_main_body_and_deduplicates_headings(
@@ -1057,6 +1090,14 @@ class TestStripHeadingLines:
         result = p._strip_heading_lines(text)
         assert "Introduction" not in result
         assert "Some paragraph text." in result
+
+    def test_strips_paragraph(self):
+        text = r"\paragraph{Contributions.}" + "\nBody text."
+
+        result = p._strip_heading_lines(text)
+
+        assert "Contributions" not in result
+        assert result == "Body text."
 
     def test_preserves_non_heading(self):
         text = "Just a paragraph."
