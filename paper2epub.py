@@ -79,11 +79,15 @@ _PARSER_MACRO_ARGS = {
     "maketitle": "",
     "RequirePackage": "[{",
     "section": "*[{",
+    "subsection": "*[{",
+    "subsubsection": "*[{",
     "usepackage": "[{",
 }
 
 _PARSER_ARGUMENT_INDEXES = {
     "section": (2,),
+    "subsection": (2,),
+    "subsubsection": (2,),
 }
 
 
@@ -975,10 +979,22 @@ def extract_abstract(main_tex: Path) -> str:
 def extract_section_headings(tex_files: list[Path]) -> list[str]:
     headings = []
     for tex in tex_files:
-        for m in re.finditer(
-            r"\\(?:sub)*section\*?\{([^}]+)\}", tex.read_text(errors="replace")
-        ):
-            headings.append(m.group(1))
+        source = SourceFile.from_path(tex)
+        document = LatexDocument(source)
+        refs = sorted(
+            (
+                ref
+                for name in ("section", "subsection", "subsubsection")
+                for ref in document.commands(name)
+            ),
+            key=lambda ref: ref.start,
+        )
+        for ref in refs:
+            if not ref.complete or ref.opaque:
+                continue
+            title = document.argument_text(ref, 0)
+            if title is not None:
+                headings.append(title)
     return headings
 
 
@@ -1130,7 +1146,15 @@ def _batch_translate(
         if idx not in translations or not _has_balanced_braces(translations[idx])
     }
     if retry_paragraphs:
-        retried = _request_numbered_translation(client, system_prompt, retry_paragraphs)
+        try:
+            retried = _request_numbered_translation(
+                client, system_prompt, retry_paragraphs
+            )
+        except Exception as e:
+            joined = ", ".join(str(idx) for idx in retry_paragraphs)
+            raise RuntimeError(
+                f"translation retry failed for paragraph IDs: {joined}"
+            ) from e
         for idx in retry_paragraphs:
             candidate = retried.get(idx)
             if candidate and _has_balanced_braces(candidate):

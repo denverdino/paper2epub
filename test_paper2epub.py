@@ -398,6 +398,20 @@ class TestBatchTranslate:
         with pytest.raises(RuntimeError, match="0"):
             p._batch_translate(object(), "", {0: "source"})
 
+    def test_retry_transport_error_reports_affected_ids(self, monkeypatch):
+        responses = iter([{0: "译文零"}, RuntimeError("request failed")])
+
+        def fake_request(*args):
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(p, "_request_numbered_translation", fake_request)
+
+        with pytest.raises(RuntimeError, match="1"):
+            p._batch_translate(object(), "", {0: "zero", 1: "one"})
+
 
 # ── Title & Author extraction ──────────────────────────────────────────────
 
@@ -915,6 +929,14 @@ class TestExtractGlossary:
 
         assert p.extract_glossary(object(), "Title", "Abstract", ["Intro"])
         assert "最多提取 50 个" in prompts[0]
+
+
+class TestExtractSectionHeadings:
+    def test_supports_optional_arguments_and_nested_commands(self, tmp_path):
+        tex = tmp_path / "section.tex"
+        tex.write_text(r"\section[Short]{About \textbf{Method}}")
+
+        assert p.extract_section_headings([tex]) == [r"About \textbf{Method}"]
 
 
 class TestTranslateTexFiles:
