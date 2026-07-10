@@ -364,6 +364,9 @@ class TestHasBalancedBraces:
     def test_missing_closing_is_invalid(self):
         assert not p._has_balanced_braces(r"中文 \textbf{术语")
 
+    def test_escaped_brace_does_not_open_group(self):
+        assert p._has_balanced_braces(r"$f(x)=\left\{x\right.$")
+
 
 class TestBatchTranslate:
     def test_retries_only_missing_ids(self, monkeypatch):

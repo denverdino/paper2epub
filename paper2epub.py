@@ -1060,7 +1060,15 @@ def _chunk_in_skip_range(
 
 def _has_balanced_braces(text: str) -> bool:
     depth = 0
-    for ch in text:
+    for i, ch in enumerate(text):
+        if ch in "{}":
+            backslashes = 0
+            j = i - 1
+            while j >= 0 and text[j] == "\\":
+                backslashes += 1
+                j -= 1
+            if backslashes % 2:
+                continue
         if ch == "{":
             depth += 1
         elif ch == "}":
