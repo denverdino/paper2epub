@@ -6,7 +6,219 @@ from pathlib import Path
 import paper2epub as p
 
 
+class TestSourceAndEditTypes:
+    def test_source_file_replaces_invalid_utf8(self, tmp_path):
+        path = tmp_path / "main.tex"
+        path.write_bytes(b"before " + bytes([0xFF]) + b" after")
+
+        source = p.SourceFile.from_path(path)
+
+        assert source.path == path
+        assert source.content == "before \ufffd after"
+
+    def test_edit_is_immutable(self, tmp_path):
+        edit = p.Edit(
+            file=tmp_path / "main.tex",
+            start=0,
+            end=3,
+            replacement="new",
+            pass_name="example",
+            safety=p.Safety.SAFE,
+        )
+
+        with pytest.raises(AttributeError):
+            edit.start = 1
+
+
+class TestLatexDocument:
+    def test_finds_nested_commands_with_source_ranges(self, tmp_path):
+        content = r"Before \section{A \textbf{nested} title} after"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        document = p.LatexDocument(source)
+
+        section = document.commands("section")[0]
+        bold = document.commands("textbf")[0]
+        assert document.source_text(section) == r"\section{A \textbf{nested} title}"
+        assert document.argument_text(section, 0) == r"A \textbf{nested} title"
+        assert document.argument_text(bold, 0) == "nested"
+        assert section.start < bold.start < bold.end <= section.end
+
+    def test_finds_environment_and_parent(self, tmp_path):
+        content = (
+            r"\begin{figure}"
+            r"\includegraphics[width=.8\linewidth]{figs/a.pdf}"
+            r"\end{figure}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        document = p.LatexDocument(source)
+
+        figure = document.environments("figure")[0]
+        image = document.commands("includegraphics")[0]
+        assert document.source_text(figure) == content
+        assert image.parent_environment == "figure"
+        assert document.argument_text(image, 0) == r"width=.8\linewidth"
+        assert document.argument_text(image, 1) == "figs/a.pdf"
+
+    def test_missing_optional_argument_returns_none(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\includegraphics{figs/a.pdf}",
+        )
+
+        document = p.LatexDocument(source)
+        image = document.commands("includegraphics")[0]
+
+        assert document.argument_text(image, 0) is None
+        assert document.argument_text(image, 1) == "figs/a.pdf"
+
+    def test_complete_arguments_expose_stable_ranges_and_metadata(self, tmp_path):
+        content = r"\includegraphics[width=.8\linewidth]{figs/a.pdf}"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        image = document.commands("includegraphics")[0]
+        optional = document.argument(image, 0)
+        required = document.argument(image, 1)
+
+        assert optional is not None
+        assert required is not None
+        assert content[optional.start:optional.end] == r"[width=.8\linewidth]"
+        assert content[required.start:required.end] == r"{figs/a.pdf}"
+        assert optional.text == r"width=.8\linewidth"
+        assert required.text == "figs/a.pdf"
+        assert optional.complete is True
+        assert required.complete is True
+        assert optional.opaque is False
+        assert required.opaque is False
+        assert image.complete is True
+        assert image.opaque is False
+        assert image.command_token_end == len(r"\includegraphics")
+        assert image.command_post_space_end == image.command_token_end
+        assert not hasattr(image, "node")
+
+    def test_incomplete_required_group_preserves_text_and_is_opaque(self, tmp_path):
+        content = r"text \section{unfinished"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        document = p.LatexDocument(source)
+        section = document.commands("section")[0]
+        title = document.argument(section, 0)
+
+        assert title is not None
+        assert title.text == "unfinished"
+        assert document.argument_text(section, 0) == "unfinished"
+        assert title.complete is False
+        assert title.opaque is True
+        assert section.complete is False
+        assert section.opaque is True
+        assert document.source_text(section) == r"\section{unfinished"
+
+    def test_incomplete_optional_group_preserves_text_and_is_opaque(self, tmp_path):
+        content = r"\includegraphics[width=.8\linewidth"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        image = document.commands("includegraphics")[0]
+        optional = document.argument(image, 0)
+
+        assert optional is not None
+        assert optional.text == r"width=.8\linewidth"
+        assert document.argument_text(image, 0) == r"width=.8\linewidth"
+        assert optional.complete is False
+        assert optional.opaque is True
+        assert image.complete is False
+        assert image.opaque is True
+
+    def test_nested_command_in_incomplete_group_inherits_opaque(self, tmp_path):
+        content = r"\section{before \textbf{nested}"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        section = document.commands("section")[0]
+        bold = document.commands("textbf")[0]
+
+        assert section.opaque is True
+        assert bold.complete is True
+        assert bold.opaque is True
+
+    def test_node_after_malformed_optional_group_inherits_opaque(self, tmp_path):
+        content = "\\documentclass[12pt\n\\maketitle\nBody"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        documentclass = document.commands("documentclass")[0]
+        maketitle = document.commands("maketitle")[0]
+
+        assert documentclass.opaque is True
+        assert maketitle.complete is True
+        assert maketitle.opaque is True
+
+    def test_starred_section_preserves_full_source_and_required_title(self, tmp_path):
+        content = r"\section*{Long}"
+        document = p.LatexDocument(p.SourceFile(tmp_path / "main.tex", content))
+
+        section = document.commands("section")[0]
+
+        assert document.source_text(section) == content
+        assert document.argument_text(section, 0) == "Long"
+
+    def test_optional_section_preserves_full_source_and_required_title(self, tmp_path):
+        content = r"\section[Short]{Long}"
+        document = p.LatexDocument(p.SourceFile(tmp_path / "main.tex", content))
+
+        section = document.commands("section")[0]
+
+        assert document.source_text(section) == content
+        assert document.argument_text(section, 0) == "Long"
+
+
 # ── Brace matching ──────────────────────────────────────────────────────────
+
+
+class TestEditPlanner:
+    def test_applies_edits_in_reverse_source_order(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "alpha beta gamma")
+        edits = [
+            p.Edit(source.path, 0, 5, "A", "one", p.Safety.SAFE),
+            p.Edit(source.path, 11, 16, "G", "two", p.Safety.SAFE),
+        ]
+
+        assert p.EditPlanner.apply(source, edits) == "A beta G"
+
+    def test_rejects_overlapping_edits(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "abcdef")
+        edits = [
+            p.Edit(source.path, 1, 4, "X", "one", p.Safety.SAFE),
+            p.Edit(source.path, 3, 5, "Y", "two", p.Safety.SAFE),
+        ]
+
+        with pytest.raises(p.EditConflictError, match="overlap"):
+            p.EditPlanner.apply(source, edits)
+
+    @pytest.mark.parametrize("start,end", [(-1, 1), (3, 2), (0, 99)])
+    def test_rejects_invalid_ranges(self, tmp_path, start, end):
+        source = p.SourceFile(tmp_path / "main.tex", "abc")
+        edit = p.Edit(
+            source.path, start, end, "", "bad", p.Safety.SAFE,
+        )
+
+        with pytest.raises(ValueError, match="invalid edit range"):
+            p.EditPlanner.apply(source, [edit])
+
+    def test_rejects_edit_for_another_file(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "abc")
+        edit = p.Edit(
+            tmp_path / "other.tex", 0, 1, "x", "bad", p.Safety.SAFE,
+        )
+
+        with pytest.raises(ValueError, match="different source file"):
+            p.EditPlanner.apply(source, [edit])
 
 
 class TestFindMatchingBrace:
@@ -299,6 +511,29 @@ class TestStripProblematicPackages:
         result = p._strip_problematic_packages_content(content)
         assert "makeatletter" not in result
         assert "makeatother" not in result
+
+
+class TestStripAtCommands:
+    def test_strips_complete_internal_definition(self):
+        content = r"before\newcommand{\pkg@internal}{value}after"
+        assert p._strip_at_commands(content) == "beforeafter"
+
+    def test_strips_definition_with_nested_replacement(self):
+        content = r"\renewcommand{\pkg@internal}[1]{outer{inner{#1}}}tail"
+        assert p._strip_at_commands(content) == "tail"
+
+    def test_preserves_incomplete_definition(self):
+        content = r"\providecommand{\pkg@internal}{unfinished"
+        assert p._strip_at_commands(content) == content
+
+    def test_leaves_non_definition_text_unchanged(self):
+        content = r"Text mentioning \pkg@internal without a definition."
+        assert p._strip_at_commands(content) == content
+
+    def test_is_idempotent(self):
+        content = r"A\DeclareRobustCommand{\pkg@internal}{x}B"
+        once = p._strip_at_commands(content)
+        assert p._strip_at_commands(once) == once
 
 
 class TestStripNoiseContent:
@@ -911,6 +1146,91 @@ class TestSimplifyDocumentclass:
         assert tex.read_text() == original
 
 
+class TestPlanSimplifyDocumentclass:
+    def test_plans_documentclass_and_maketitle_edits(self, tmp_path):
+        content = (
+            "\\documentclass[12pt]{IEEEtran}\n"
+            "\\begin{document}\n"
+            "  \\maketitle  \n"
+            "Body\n"
+            "\\end{document}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        document = p.LatexDocument(source)
+
+        edits = p.plan_simplify_documentclass(source, document)
+        result = p.EditPlanner.apply(source, edits)
+
+        assert result == (
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "Body\n"
+            "\\end{document}"
+        )
+        assert all(edit.safety is p.Safety.SAFE for edit in edits)
+
+    def test_plan_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\documentclass{article}\begin{document}Body\end{document}",
+        )
+        first = p.EditPlanner.apply(
+            source,
+            p.plan_simplify_documentclass(source, p.LatexDocument(source)),
+        )
+        second_source = p.SourceFile(source.path, first)
+
+        assert p.plan_simplify_documentclass(
+            second_source,
+            p.LatexDocument(second_source),
+        ) == []
+
+    def test_file_wrapper_tolerates_invalid_utf8(self, tmp_path):
+        tex = tmp_path / "main.tex"
+        tex.write_bytes(
+            b"\\documentclass{IEEEtran}\n% " + bytes([0xFF]) + b"\n"
+        )
+
+        p.simplify_documentclass(tex)
+
+        assert tex.read_text() == "\\documentclass{article}\n% \ufffd\n"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "\\documentclass{IEEEtran\n\\begin{document}Body\\end{document}",
+            "\\documentclass[12pt\n\\begin{document}Body\\end{document}",
+            "\\documentclass\n\\begin{document}Body\\end{document}",
+        ],
+        ids=["incomplete-required", "incomplete-optional", "missing-required"],
+    )
+    def test_malformed_documentclass_is_preserved(self, tmp_path, content):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        edits = p.plan_simplify_documentclass(source, p.LatexDocument(source))
+
+        assert edits == []
+        assert p.EditPlanner.apply(source, edits) == content
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "\\documentclass{IEEEtran\n\\maketitle\nBody",
+            "\\documentclass[12pt\n\\maketitle\nBody",
+        ],
+        ids=["required-contains-maketitle", "optional-precedes-maketitle"],
+    )
+    def test_maketitle_in_opaque_documentclass_is_preserved(
+        self, tmp_path, content,
+    ):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        edits = p.plan_simplify_documentclass(source, p.LatexDocument(source))
+
+        assert edits == []
+        assert p.EditPlanner.apply(source, edits) == content
+
+
 # ── get_input_order ─────────────────────────────────────────────────────────
 
 
@@ -943,6 +1263,62 @@ class TestGetInputOrder:
         main.write_text(r"\input{shared}\input{shared}")
         result = p.get_input_order(main)
         assert len(result) == 2  # main + shared, no dup
+
+
+class TestNormalizeInputExtensionsContent:
+    def test_resolves_root_include(self, tmp_path):
+        main = tmp_path / "main.tex"
+        (tmp_path / "chapter.tex").write_text("chapter")
+
+        result = p._normalize_input_extensions_content(
+            r"\input{chapter}", main, tmp_path,
+        )
+
+        assert result == r"\input{chapter.tex}"
+
+    def test_resolves_nested_sibling_before_document_root(self, tmp_path):
+        nested = tmp_path / "sections" / "intro.tex"
+        nested.parent.mkdir()
+        (nested.parent / "detail.tex").write_text("nested detail")
+
+        result = p._normalize_input_extensions_content(
+            r"\input{detail}", nested, tmp_path,
+        )
+
+        assert result == r"\input{detail.tex}"
+
+    def test_preserves_existing_extension(self, tmp_path):
+        content = r"\include{appendix.tex}"
+        assert p._normalize_input_extensions_content(
+            content, tmp_path / "main.tex", tmp_path,
+        ) == content
+
+    def test_preserves_missing_target(self, tmp_path):
+        content = r"\input{missing}"
+        assert p._normalize_input_extensions_content(
+            content, tmp_path / "main.tex", tmp_path,
+        ) == content
+
+    def test_is_idempotent(self, tmp_path):
+        main = tmp_path / "main.tex"
+        (tmp_path / "chapter.tex").write_text("chapter")
+        first = p._normalize_input_extensions_content(
+            r"\input{chapter}", main, tmp_path,
+        )
+        assert p._normalize_input_extensions_content(
+            first, main, tmp_path,
+        ) == first
+
+    def test_file_wrapper_uses_each_referencing_path(self, tmp_path):
+        sections = tmp_path / "sections"
+        sections.mkdir()
+        intro = sections / "intro.tex"
+        intro.write_text(r"\input{detail}")
+        (sections / "detail.tex").write_text("detail")
+
+        p.normalize_input_extensions(tmp_path)
+
+        assert intro.read_text() == r"\input{detail.tex}"
 
 
 # ── extract_abstract ────────────────────────────────────────────────────────
