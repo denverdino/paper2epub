@@ -1115,6 +1115,13 @@ class TestStripHeadingLines:
 
         assert result == "Body text."
 
+    def test_strips_multiline_paragraph_as_one_command(self):
+        text = "\\paragraph{\nContributions.\n}\nBody text."
+
+        result = p._strip_heading_lines(text)
+
+        assert result == "Body text."
+
     def test_preserves_non_heading(self):
         text = "Just a paragraph."
         assert p._strip_heading_lines(text) == text

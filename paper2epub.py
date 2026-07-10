@@ -922,9 +922,11 @@ PURE_CMD_LINE = re.compile(
     r"|renewcommand|pagestyle|thispagestyle)\b"
 )
 
-SECTION_HEADING_LINE_RE = re.compile(
-    r"^\s*\\(?:section|subsection|subsubsection|paragraph)\*?(?:\[[^\]]*\])?\{",
-    re.MULTILINE,
+TRANSLATABLE_HEADING_NAMES = (
+    "section",
+    "subsection",
+    "subsubsection",
+    "paragraph",
 )
 
 
@@ -986,12 +988,7 @@ def extract_section_headings(tex_files: list[Path]) -> list[str]:
         refs = sorted(
             (
                 ref
-                for name in (
-                    "section",
-                    "subsection",
-                    "subsubsection",
-                    "paragraph",
-                )
+                for name in TRANSLATABLE_HEADING_NAMES
                 for ref in document.commands(name)
             ),
             key=lambda ref: ref.start,
@@ -1027,25 +1024,38 @@ def extract_glossary(
 
 
 def _strip_heading_lines(text: str) -> str:
-    result = []
-    for line in text.splitlines():
-        match = SECTION_HEADING_LINE_RE.match(line)
-        if not match:
-            result.append(line)
+    source = SourceFile(Path("<heading-strip>"), text)
+    document = LatexDocument(source)
+    refs = sorted(
+        (
+            ref
+            for name in TRANSLATABLE_HEADING_NAMES
+            for ref in document.commands(name)
+        ),
+        key=lambda ref: ref.start,
+    )
+    edits = []
+    selected_end = -1
+    for ref in refs:
+        if not ref.complete or ref.opaque or ref.start < selected_end:
             continue
-
-        brace_start = match.end() - 1
-        brace_end = find_matching_brace(line, brace_start)
-        if brace_end is None:
-            continue
-        remainder = line[brace_end + 1 :]
-        label_match = re.match(r"\s*\\label\{[^}]*\}", remainder)
+        end = ref.end
+        label_match = re.match(r"\s*\\label\{[^}]*\}", text[end:])
         if label_match:
-            remainder = remainder[label_match.end() :]
-        if remainder := remainder.lstrip():
-            result.append(remainder)
+            end += label_match.end()
+        edits.append(
+            Edit(
+                file=source.path,
+                start=ref.start,
+                end=end,
+                replacement="",
+                pass_name="strip_heading_lines",
+                safety=Safety.SAFE,
+            )
+        )
+        selected_end = end
 
-    return "\n".join(result).strip()
+    return EditPlanner.apply(source, edits).strip()
 
 
 def _is_prose(chunk: str) -> bool:
@@ -1236,12 +1246,7 @@ def _translate_headings(heading_translations: dict[str, str], content: str) -> s
     refs = sorted(
         (
             ref
-            for name in (
-                "section",
-                "subsection",
-                "subsubsection",
-                "paragraph",
-            )
+            for name in TRANSLATABLE_HEADING_NAMES
             for ref in document.commands(name)
         ),
         key=lambda ref: ref.start,
