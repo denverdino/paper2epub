@@ -1057,20 +1057,40 @@ def _chunk_in_skip_range(
     return False
 
 
-def _fix_braces(text: str) -> str:
+def _has_balanced_braces(text: str) -> bool:
     depth = 0
-    result = []
     for ch in text:
         if ch == "{":
             depth += 1
-            result.append(ch)
         elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                result.append(ch)
-        else:
-            result.append(ch)
-    return "".join(result)
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _request_numbered_translation(
+    client, system_prompt: str, numbered_paragraphs: dict[int, str]
+) -> dict[int, str]:
+    user_prompt = "\n\n".join(
+        f"[{idx}]\n{numbered_paragraphs[idx]}"
+        for idx in sorted(numbered_paragraphs)
+    )
+
+    for attempt in range(3):
+        try:
+            raw = _chat(client, system_prompt, user_prompt)
+            return _parse_numbered_response(raw)
+        except Exception as e:
+            if attempt < 2:
+                import time
+
+                time.sleep(2**attempt)
+                print(f"  Retry {attempt + 1} ...", file=sys.stderr)
+            else:
+                raise RuntimeError("batch translation request failed") from e
+
+    raise AssertionError("unreachable")
 
 
 def _batch_translate(
@@ -1092,26 +1112,31 @@ def _batch_translate(
         "7. 只输出翻译结果，不要添加任何解释"
     )
 
-    parts = []
-    for idx in sorted(numbered_paragraphs):
-        parts.append(f"[{idx}]\n{numbered_paragraphs[idx]}")
-    user_prompt = "\n\n".join(parts)
+    translations = _request_numbered_translation(
+        client, system_prompt, numbered_paragraphs
+    )
+    retry_paragraphs = {
+        idx: text
+        for idx, text in numbered_paragraphs.items()
+        if idx not in translations or not _has_balanced_braces(translations[idx])
+    }
+    if retry_paragraphs:
+        retried = _request_numbered_translation(client, system_prompt, retry_paragraphs)
+        for idx in retry_paragraphs:
+            candidate = retried.get(idx)
+            if candidate and _has_balanced_braces(candidate):
+                translations[idx] = candidate
 
-    for attempt in range(3):
-        try:
-            raw = _chat(client, system_prompt, user_prompt)
-            break
-        except Exception as e:
-            if attempt < 2:
-                import time
+    invalid_ids = [
+        idx
+        for idx in numbered_paragraphs
+        if idx not in translations or not _has_balanced_braces(translations[idx])
+    ]
+    if invalid_ids:
+        joined = ", ".join(str(idx) for idx in invalid_ids)
+        raise RuntimeError(f"incomplete translation for paragraph IDs: {joined}")
 
-                time.sleep(2**attempt)
-                print(f"  Retry {attempt + 1} ...", file=sys.stderr)
-            else:
-                print(f"  Warning: batch translation failed: {e}", file=sys.stderr)
-                return {}
-
-    return _parse_numbered_response(raw, postprocess=_fix_braces)
+    return {idx: translations[idx] for idx in numbered_paragraphs}
 
 
 def _translate_heading_texts(client, glossary: str, texts: list[str]) -> dict[int, str]:

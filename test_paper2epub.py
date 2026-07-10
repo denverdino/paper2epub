@@ -329,7 +329,7 @@ class TestParseNumberedResponse:
 
     def test_with_postprocess(self):
         raw = "[0]\nhello}"
-        result = p._parse_numbered_response(raw, postprocess=p._fix_braces)
+        result = p._parse_numbered_response(raw, postprocess=lambda text: text.rstrip("}"))
         assert result == {0: "hello"}
 
     def test_non_sequential_ids(self):
@@ -351,21 +351,49 @@ class TestParseNumberedResponse:
         assert result[0] == "line one\nline two"
 
 
-# ── _fix_braces ─────────────────────────────────────────────────────────────
+# ── Translation response validation ─────────────────────────────────────────
 
 
-class TestFixBraces:
+class TestHasBalancedBraces:
     def test_balanced(self):
-        assert p._fix_braces("{ok}") == "{ok}"
+        assert p._has_balanced_braces(r"中文 \textbf{术语}")
 
-    def test_extra_closing(self):
-        assert p._fix_braces("text}extra}") == "textextra"
+    def test_extra_closing_is_invalid(self):
+        assert not p._has_balanced_braces("中文}")
 
-    def test_nested_balanced(self):
-        assert p._fix_braces("{a{b}c}") == "{a{b}c}"
+    def test_missing_closing_is_invalid(self):
+        assert not p._has_balanced_braces(r"中文 \textbf{术语")
 
-    def test_mixed_unbalanced(self):
-        assert p._fix_braces("{a}b}c{d}") == "{a}bc{d}"
+
+class TestBatchTranslate:
+    def test_retries_only_missing_ids(self, monkeypatch):
+        calls = []
+        responses = iter(["[0]\n译文零", "[1]\n译文一"])
+
+        def fake_chat(client, system_prompt, user_prompt):
+            calls.append(user_prompt)
+            return next(responses)
+
+        monkeypatch.setattr(p, "_chat", fake_chat)
+        result = p._batch_translate(
+            object(), "term | 术语", {0: "zero", 1: "one"}
+        )
+
+        assert result == {0: "译文零", 1: "译文一"}
+        assert "[0]" in calls[0] and "[1]" in calls[0]
+        assert "[0]" not in calls[1] and "[1]" in calls[1]
+
+    def test_retries_invalid_braces(self, monkeypatch):
+        responses = iter(["[0]\n错误}", "[0]\n正确"])
+        monkeypatch.setattr(p, "_chat", lambda *args: next(responses))
+
+        assert p._batch_translate(object(), "", {0: "source"}) == {0: "正确"}
+
+    def test_raises_when_retry_is_still_incomplete(self, monkeypatch):
+        monkeypatch.setattr(p, "_chat", lambda *args: "")
+
+        with pytest.raises(RuntimeError, match="0"):
+            p._batch_translate(object(), "", {0: "source"})
 
 
 # ── Title & Author extraction ──────────────────────────────────────────────
