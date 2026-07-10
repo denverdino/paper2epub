@@ -81,6 +81,24 @@ class TestLatexDocument:
         assert isinstance(document.parse_warnings, tuple)
         assert document.source.content == r"text \section{unfinished"
 
+    def test_starred_section_preserves_full_source_and_required_title(self, tmp_path):
+        content = r"\section*{Long}"
+        document = p.LatexDocument(p.SourceFile(tmp_path / "main.tex", content))
+
+        section = document.commands("section")[0]
+
+        assert document.source_text(section) == content
+        assert document.argument_text(section, 0) == "Long"
+
+    def test_optional_section_preserves_full_source_and_required_title(self, tmp_path):
+        content = r"\section[Short]{Long}"
+        document = p.LatexDocument(p.SourceFile(tmp_path / "main.tex", content))
+
+        section = document.commands("section")[0]
+
+        assert document.source_text(section) == content
+        assert document.argument_text(section, 0) == "Long"
+
 
 # ── Brace matching ──────────────────────────────────────────────────────────
 

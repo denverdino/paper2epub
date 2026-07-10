@@ -78,8 +78,12 @@ _PARSER_MACRO_ARGS = {
     "input": "{",
     "maketitle": "",
     "RequirePackage": "[{",
-    "section": "{",
+    "section": "*[{",
     "usepackage": "[{",
+}
+
+_PARSER_ARGUMENT_INDEXES = {
+    "section": (2,),
 }
 
 
@@ -180,7 +184,12 @@ class LatexDocument:
 
     def argument_text(self, ref: LatexNodeRef, index: int) -> str | None:
         nodeargd = getattr(ref.node, "nodeargd", None)
-        if nodeargd is None or index >= len(nodeargd.argnlist):
+        argument_indexes = _PARSER_ARGUMENT_INDEXES.get(ref.name)
+        if argument_indexes is not None:
+            if index < 0 or index >= len(argument_indexes):
+                return None
+            index = argument_indexes[index]
+        if nodeargd is None or index < 0 or index >= len(nodeargd.argnlist):
             return None
         argument = nodeargd.argnlist[index]
         if argument is None:
