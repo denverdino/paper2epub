@@ -1448,6 +1448,46 @@ def simplify_documentclass(tex_path: Path) -> None:
         tex_path.write_text(EditPlanner.apply(source, edits))
 
 
+def plan_unnumber_paragraphs(
+    source: SourceFile,
+    document: LatexDocument,
+) -> list[Edit]:
+    edits = []
+    for ref in document.commands("paragraph"):
+        title = document.argument(ref, 0)
+        star = ref.arguments[0] if ref.arguments else None
+        if (
+            not ref.complete
+            or ref.opaque
+            or title is None
+            or not title.complete
+            or title.opaque
+            or star is not None
+        ):
+            continue
+        edits.append(
+            Edit(
+                file=source.path,
+                start=ref.command_token_end,
+                end=ref.command_token_end,
+                replacement="*",
+                pass_name="unnumber_paragraphs",
+                safety=Safety.SAFE,
+            )
+        )
+    return edits
+
+
+def unnumber_paragraph_headings(paper_dir: Path) -> None:
+    for tex in paper_dir.glob("**/*.tex"):
+        source = SourceFile.from_path(tex)
+        document = LatexDocument(source)
+        edits = plan_unnumber_paragraphs(source, document)
+        if edits:
+            tex.write_text(EditPlanner.apply(source, edits))
+            print(f"Unnumbered paragraph headings: {tex.name}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Preamble & noise cleanup
 # ---------------------------------------------------------------------------
@@ -2595,6 +2635,7 @@ def main():
         client = create_openai_client()
         translate_tex_files(paper_dir, main_tex, client, title)
 
+    unnumber_paragraph_headings(paper_dir)
     normalize_input_extensions(paper_dir)
 
     suffix = "-zh" if args.translate else ""

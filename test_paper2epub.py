@@ -1403,6 +1403,81 @@ class TestPlanSimplifyDocumentclass:
         assert p.EditPlanner.apply(source, edits) == content
 
 
+class TestPlanUnnumberParagraphs:
+    def plan(self, tmp_path, content):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        document = p.LatexDocument(source)
+        return source, p.plan_unnumber_paragraphs(source, document)
+
+    def test_inserts_star_after_command_token(self, tmp_path):
+        source, edits = self.plan(tmp_path, r"\paragraph{Contributions.} Body")
+
+        assert len(edits) == 1
+        assert edits[0].start == len(r"\paragraph")
+        assert edits[0].start == edits[0].end
+        assert edits[0].replacement == "*"
+        assert edits[0].safety is p.Safety.SAFE
+        assert (
+            p.EditPlanner.apply(source, edits)
+            == r"\paragraph*{Contributions.} Body"
+        )
+
+    def test_preserves_optional_nested_multiline_content(self, tmp_path):
+        content = "\\paragraph[Short]{About \\textbf{Method}\nDetails}\\label{x} Body"
+        source, edits = self.plan(tmp_path, content)
+
+        assert p.EditPlanner.apply(source, edits) == content.replace(
+            r"\paragraph", r"\paragraph*", 1
+        )
+
+    def test_already_starred_is_unchanged(self, tmp_path):
+        _, edits = self.plan(tmp_path, r"\paragraph*{Existing}")
+
+        assert edits == []
+
+    def test_incomplete_title_is_unchanged(self, tmp_path):
+        _, edits = self.plan(tmp_path, r"\paragraph{Incomplete")
+
+        assert edits == []
+
+    def test_opaque_paragraph_is_unchanged(self, tmp_path):
+        _, edits = self.plan(tmp_path, r"\section{Outer \paragraph{Inner}")
+
+        assert edits == []
+
+    def test_idempotent(self, tmp_path):
+        source, edits = self.plan(tmp_path, r"\paragraph{Title}")
+        once = p.EditPlanner.apply(source, edits)
+        second_source, second_edits = self.plan(tmp_path, once)
+
+        assert p.EditPlanner.apply(second_source, second_edits) == once
+        assert second_edits == []
+
+
+class TestUnnumberParagraphHeadings:
+    def test_processes_nested_tex_files(self, tmp_path):
+        nested = tmp_path / "sections"
+        nested.mkdir()
+        tex = nested / "intro.tex"
+        tex.write_text(r"\paragraph{Contributions.} Body")
+
+        p.unnumber_paragraph_headings(tmp_path)
+
+        assert tex.read_text() == r"\paragraph*{Contributions.} Body"
+
+
+class TestParagraphUnnumberingPipeline:
+    def test_runs_after_translation_and_before_input_normalization(self):
+        source = Path(p.__file__).read_text()
+        main_source = source[source.index("def main():") :]
+
+        assert (
+            main_source.index("translate_tex_files(")
+            < main_source.index("unnumber_paragraph_headings(")
+            < main_source.index("normalize_input_extensions(")
+        )
+
+
 # ── get_input_order ─────────────────────────────────────────────────────────
 
 
