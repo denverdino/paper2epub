@@ -7,12 +7,15 @@
 #     "openai",
 #     "PySocks",
 #     "httpx[socks]",
+#     "pylatexenc>=2.10,<3",
 # ]
 # ///
 """Download an arXiv paper's LaTeX source and convert it to EPUB."""
 
 import argparse
 import datetime
+from dataclasses import dataclass
+from enum import Enum
 import os
 import re
 import shutil
@@ -28,6 +31,33 @@ from collections.abc import Callable
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+class Safety(Enum):
+    SAFE = "safe"
+    LOSSY = "lossy"
+    FALLBACK_ONLY = "fallback_only"
+
+
+@dataclass(frozen=True)
+class SourceFile:
+    path: Path
+    content: str
+
+    @classmethod
+    def from_path(cls, path: Path) -> "SourceFile":
+        return cls(path=path, content=path.read_text(errors="replace"))
+
+
+@dataclass(frozen=True)
+class Edit:
+    file: Path
+    start: int
+    end: int
+    replacement: str
+    pass_name: str
+    safety: Safety
+
 
 _ALGO_CMD_NAMES = (
     "Require", "Ensure", "State", "For", "EndFor", "ForAll",

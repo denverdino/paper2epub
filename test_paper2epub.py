@@ -6,6 +6,30 @@ from pathlib import Path
 import paper2epub as p
 
 
+class TestSourceAndEditTypes:
+    def test_source_file_replaces_invalid_utf8(self, tmp_path):
+        path = tmp_path / "main.tex"
+        path.write_bytes(b"before " + bytes([0xFF]) + b" after")
+
+        source = p.SourceFile.from_path(path)
+
+        assert source.path == path
+        assert source.content == "before \ufffd after"
+
+    def test_edit_is_immutable(self, tmp_path):
+        edit = p.Edit(
+            file=tmp_path / "main.tex",
+            start=0,
+            end=3,
+            replacement="new",
+            pass_name="example",
+            safety=p.Safety.SAFE,
+        )
+
+        with pytest.raises(AttributeError):
+            edit.start = 1
+
+
 # ── Brace matching ──────────────────────────────────────────────────────────
 
 
