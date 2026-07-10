@@ -1045,6 +1045,56 @@ class TestSimplifyDocumentclass:
         assert tex.read_text() == original
 
 
+class TestPlanSimplifyDocumentclass:
+    def test_plans_documentclass_and_maketitle_edits(self, tmp_path):
+        content = (
+            "\\documentclass[12pt]{IEEEtran}\n"
+            "\\begin{document}\n"
+            "  \\maketitle  \n"
+            "Body\n"
+            "\\end{document}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        document = p.LatexDocument(source)
+
+        edits = p.plan_simplify_documentclass(source, document)
+        result = p.EditPlanner.apply(source, edits)
+
+        assert result == (
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "Body\n"
+            "\\end{document}"
+        )
+        assert all(edit.safety is p.Safety.SAFE for edit in edits)
+
+    def test_plan_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\documentclass{article}\begin{document}Body\end{document}",
+        )
+        first = p.EditPlanner.apply(
+            source,
+            p.plan_simplify_documentclass(source, p.LatexDocument(source)),
+        )
+        second_source = p.SourceFile(source.path, first)
+
+        assert p.plan_simplify_documentclass(
+            second_source,
+            p.LatexDocument(second_source),
+        ) == []
+
+    def test_file_wrapper_tolerates_invalid_utf8(self, tmp_path):
+        tex = tmp_path / "main.tex"
+        tex.write_bytes(
+            b"\\documentclass{IEEEtran}\n% " + bytes([0xFF]) + b"\n"
+        )
+
+        p.simplify_documentclass(tex)
+
+        assert tex.read_text() == "\\documentclass{article}\n% \ufffd\n"
+
+
 # ── get_input_order ─────────────────────────────────────────────────────────
 
 

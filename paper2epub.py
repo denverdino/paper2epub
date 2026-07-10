@@ -1150,14 +1150,61 @@ def find_main_tex(paper_dir: Path) -> Path:
     sys.exit(1)
 
 
+def _whole_line_range_if_alone(
+    content: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    line_start = content.rfind("\n", 0, start) + 1
+    next_newline = content.find("\n", end)
+    line_end = len(content) if next_newline == -1 else next_newline + 1
+    if (
+        not content[line_start:start].strip()
+        and not content[end:line_end].strip()
+    ):
+        return line_start, line_end
+    return start, end
+
+
+def plan_simplify_documentclass(
+    source: SourceFile,
+    document: LatexDocument,
+) -> list[Edit]:
+    edits: list[Edit] = []
+    for ref in document.commands("documentclass"):
+        if document.source_text(ref) != r"\documentclass{article}":
+            edits.append(Edit(
+                file=source.path,
+                start=ref.start,
+                end=ref.end,
+                replacement=r"\documentclass{article}",
+                pass_name="simplify_documentclass",
+                safety=Safety.SAFE,
+            ))
+    for ref in document.commands("maketitle"):
+        command_end = ref.end - len(ref.node.macro_post_space)
+        start, end = _whole_line_range_if_alone(
+            source.content,
+            ref.start,
+            command_end,
+        )
+        edits.append(Edit(
+            file=source.path,
+            start=start,
+            end=end,
+            replacement="",
+            pass_name="remove_maketitle",
+            safety=Safety.SAFE,
+        ))
+    return edits
+
+
 def simplify_documentclass(tex_path: Path) -> None:
-    content = tex_path.read_text()
-    updated = content
-    for start, end, _ in reversed(list(iter_latex_command_args(content, "documentclass"))):
-        updated = updated[:start] + r"\documentclass{article}" + updated[end:]
-    updated = re.sub(r"^\s*\\maketitle\s*$", "", updated, flags=re.MULTILINE)
-    if updated != content:
-        tex_path.write_text(updated)
+    source = SourceFile.from_path(tex_path)
+    document = LatexDocument(source)
+    edits = plan_simplify_documentclass(source, document)
+    if edits:
+        tex_path.write_text(EditPlanner.apply(source, edits))
 
 
 # ---------------------------------------------------------------------------
