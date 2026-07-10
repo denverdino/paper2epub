@@ -38,13 +38,14 @@ Reference: https://info.arxiv.org/help/submit_tex.html and https://info.arxiv.or
 - `uv` — runs the script with automatic dependency management (Python deps declared via PEP 723 inline metadata)
 - `curl` — downloads the arXiv source tarball
 - `pandoc` — converts LaTeX to EPUB3 (uses `--mathml` for math rendering)
+- `pylatexenc>=2.10,<3` — parses LaTeX structure (declared in the PEP 723 metadata)
 - `DASHSCOPE_API_KEY` environment variable — required for `--translate` mode (Alibaba Bailian API key)
 - `SMTP_PROXY` environment variable — optional SOCKS5 proxy for `--email` mode (format: `socks5://[user:pass@]host:port`)
 
 ## Testing
 
 ```bash
-python3 -m pytest test_paper2epub.py -v
+uv run --with pytest --with 'pylatexenc>=2.10,<3' python -m pytest test_paper2epub.py -q
 ```
 
 - All tests live in `test_paper2epub.py`. No network or API calls — tests use `tmp_path` for filesystem operations.

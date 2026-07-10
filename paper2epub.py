@@ -102,14 +102,29 @@ def _build_latex_context():
 
 
 @dataclass(frozen=True)
+class LatexArgumentRef:
+    start: int
+    end: int
+    text: str
+    opening_delimiter: str | None
+    closing_delimiter: str | None
+    complete: bool
+    opaque: bool
+
+
+@dataclass(frozen=True)
 class LatexNodeRef:
     file: Path
-    node: Any
     kind: str
     name: str
     start: int
     end: int
     parent_environment: str | None
+    arguments: tuple[LatexArgumentRef | None, ...]
+    command_token_end: int
+    command_post_space_end: int
+    complete: bool
+    opaque: bool
 
 
 class LatexDocument:
@@ -136,26 +151,12 @@ class LatexDocument:
         for node in nodes:
             child_parent = parent_environment
             if isinstance(node, LatexMacroNode):
-                yield LatexNodeRef(
-                    self.source.path,
-                    node,
-                    "command",
-                    node.macroname,
-                    node.pos,
-                    node.pos + node.len,
-                    parent_environment,
-                )
+                yield self._make_ref(node, "command", node.macroname,
+                                     parent_environment)
             elif isinstance(node, LatexEnvironmentNode):
                 child_parent = node.environmentname
-                yield LatexNodeRef(
-                    self.source.path,
-                    node,
-                    "environment",
-                    node.environmentname,
-                    node.pos,
-                    node.pos + node.len,
-                    parent_environment,
-                )
+                yield self._make_ref(node, "environment", node.environmentname,
+                                     parent_environment)
 
             nodeargd = getattr(node, "nodeargd", None)
             if nodeargd is not None:
@@ -166,6 +167,103 @@ class LatexDocument:
             children = getattr(node, "nodelist", None)
             if children:
                 yield from self._walk(children, child_parent)
+
+    def _make_argument_ref(self, argument: Any) -> LatexArgumentRef:
+        start = argument.pos
+        end = argument.pos + argument.len
+        opening = closing = None
+        complete = True
+        content_start = start
+        content_end = end
+        if isinstance(argument, LatexGroupNode):
+            opening, closing = argument.delimiters
+            if opening is not None:
+                content_start += len(opening)
+            if closing is not None:
+                matching_end = None
+                if opening == "{" and closing == "}":
+                    matching_end = find_matching_brace(self.source.content, start)
+                elif opening == "[" and closing == "]":
+                    matching_end = find_matching_bracket(self.source.content, start)
+                complete = matching_end == end - len(closing)
+                if complete:
+                    content_end -= len(closing)
+        return LatexArgumentRef(
+            start=start,
+            end=end,
+            text=self.source.content[content_start:content_end],
+            opening_delimiter=opening,
+            closing_delimiter=closing,
+            complete=complete,
+            opaque=not complete,
+        )
+
+    def _make_ref(
+        self,
+        node: Any,
+        kind: str,
+        name: str,
+        parent_environment: str | None,
+    ) -> LatexNodeRef:
+        nodeargd = getattr(node, "nodeargd", None)
+        argspec = _PARSER_MACRO_ARGS.get(name, "") if kind == "command" else ""
+        argument_nodes = list(nodeargd.argnlist) if nodeargd is not None else []
+        if len(argument_nodes) < len(argspec):
+            argument_nodes.extend([None] * (len(argspec) - len(argument_nodes)))
+        arguments = [
+            None if argument is None else self._make_argument_ref(argument)
+            for argument in argument_nodes
+        ]
+
+        token_end = node.pos
+        post_space_end = node.pos
+        if kind == "command":
+            token_end = node.pos + 1 + len(name)
+            post_space_end = token_end + len(getattr(node, "macro_post_space", ""))
+
+            # Tolerant parsing leaves an unmatched optional group outside the
+            # macro node. Represent it explicitly so callers never infer
+            # completeness from parser-specific node behavior.
+            for index, marker in enumerate(argspec):
+                if marker != "[" or arguments[index] is not None:
+                    continue
+                if self.source.content.startswith("[", post_space_end):
+                    arguments[index] = LatexArgumentRef(
+                        start=post_space_end,
+                        end=len(self.source.content),
+                        text=self.source.content[post_space_end + 1:],
+                        opening_delimiter="[",
+                        closing_delimiter="]",
+                        complete=False,
+                        opaque=True,
+                    )
+                break
+
+        required_indexes = tuple(
+            index for index, marker in enumerate(argspec) if marker == "{"
+        )
+        complete = all(argument is None or argument.complete for argument in arguments)
+        complete = complete and all(
+            index < len(arguments) and arguments[index] is not None
+            for index in required_indexes
+        )
+        end = max(
+            [node.pos + node.len]
+            + [argument.end for argument in arguments if argument is not None]
+        )
+        return LatexNodeRef(
+            file=self.source.path,
+            kind=kind,
+            name=name,
+            start=node.pos,
+            end=end,
+            parent_environment=parent_environment,
+            arguments=tuple(arguments),
+            command_token_end=token_end,
+            command_post_space_end=post_space_end,
+            complete=complete,
+            opaque=not complete,
+        )
 
     def commands(self, name: str) -> list[LatexNodeRef]:
         return [
@@ -183,23 +281,22 @@ class LatexDocument:
         return self.source.content[ref.start:ref.end]
 
     def argument_text(self, ref: LatexNodeRef, index: int) -> str | None:
-        nodeargd = getattr(ref.node, "nodeargd", None)
+        argument = self.argument(ref, index)
+        return None if argument is None else argument.text
+
+    def argument(
+        self,
+        ref: LatexNodeRef,
+        index: int,
+    ) -> LatexArgumentRef | None:
         argument_indexes = _PARSER_ARGUMENT_INDEXES.get(ref.name)
         if argument_indexes is not None:
             if index < 0 or index >= len(argument_indexes):
                 return None
             index = argument_indexes[index]
-        if nodeargd is None or index < 0 or index >= len(nodeargd.argnlist):
+        if index < 0 or index >= len(ref.arguments):
             return None
-        argument = nodeargd.argnlist[index]
-        if argument is None:
-            return None
-        text = self.source.content[argument.pos:argument.pos + argument.len]
-        if isinstance(argument, LatexGroupNode):
-            opening, closing = argument.delimiters
-            if opening is not None and closing is not None:
-                return text[len(opening):-len(closing)]
-        return text
+        return ref.arguments[index]
 
 
 class EditConflictError(ValueError):
@@ -1172,6 +1269,17 @@ def plan_simplify_documentclass(
 ) -> list[Edit]:
     edits: list[Edit] = []
     for ref in document.commands("documentclass"):
+        class_argument = document.argument(ref, 1)
+        if (
+            not ref.complete
+            or ref.opaque
+            or class_argument is None
+            or not class_argument.complete
+            or class_argument.opaque
+            or class_argument.opening_delimiter != "{"
+            or class_argument.closing_delimiter != "}"
+        ):
+            continue
         if document.source_text(ref) != r"\documentclass{article}":
             edits.append(Edit(
                 file=source.path,
@@ -1182,11 +1290,10 @@ def plan_simplify_documentclass(
                 safety=Safety.SAFE,
             ))
     for ref in document.commands("maketitle"):
-        command_end = ref.end - len(ref.node.macro_post_space)
         start, end = _whole_line_range_if_alone(
             source.content,
             ref.start,
-            command_end,
+            ref.command_token_end,
         )
         edits.append(Edit(
             file=source.path,
@@ -2125,24 +2232,37 @@ def _iter_graphicspath_dirs(content: str) -> list[str]:
     return dirs
 
 
+def _normalize_input_extensions_content(
+    content: str,
+    tex_path: Path,
+    paper_dir: Path,
+) -> str:
+    r"""Append .tex only when an include target can be resolved."""
+    for cmd in ("input", "include"):
+        shifts = 0
+        matches = list(iter_latex_command_args(content, cmd, optional=False))
+        for start, end, raw_arg in matches:
+            arg = raw_arg.strip()
+            if arg.endswith(".tex"):
+                continue
+            relative_target = tex_path.parent / f"{arg}.tex"
+            root_target = paper_dir / f"{arg}.tex"
+            if not relative_target.exists() and not root_target.exists():
+                continue
+            new_cmd = f"\\{cmd}{{{arg}.tex}}"
+            content = content[:start + shifts] + new_cmd + content[end + shifts:]
+            shifts += len(new_cmd) - (end - start)
+    return content
+
+
 def normalize_input_extensions(paper_dir: Path) -> None:
     r"""Append .tex to \input/\include args so Pandoc 3.x can resolve them."""
-
-    def _add_tex_ext(content: str) -> str:
-        for cmd in ("input", "include"):
-            shifts = 0
-            for start, end, arg in list(iter_latex_command_args(content, cmd, optional=False)):
-                arg = arg.strip()
-                if arg.endswith(".tex"):
-                    continue
-                if not (paper_dir / f"{arg}.tex").exists():
-                    continue
-                new_cmd = f"\\{cmd}{{{arg}.tex}}"
-                content = content[: start + shifts] + new_cmd + content[end + shifts :]
-                shifts += len(new_cmd) - (end - start)
-        return content
-
-    _transform_tex_files(paper_dir, _add_tex_ext, "Normalized input extensions")
+    for tex in paper_dir.glob("**/*.tex"):
+        content = tex.read_text(errors="replace")
+        updated = _normalize_input_extensions_content(content, tex, paper_dir)
+        if updated != content:
+            tex.write_text(updated)
+            print(f"Normalized input extensions: {tex.name}", file=sys.stderr)
 
 
 def collect_graphicspath_dirs(paper_dir: Path) -> list[str]:
