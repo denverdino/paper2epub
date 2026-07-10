@@ -4,3 +4,4 @@ paper.tar.gz
 .claude
 __pycache__
 .env
+.worktrees/
