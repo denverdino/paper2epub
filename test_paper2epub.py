@@ -103,6 +103,46 @@ class TestLatexDocument:
 # ── Brace matching ──────────────────────────────────────────────────────────
 
 
+class TestEditPlanner:
+    def test_applies_edits_in_reverse_source_order(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "alpha beta gamma")
+        edits = [
+            p.Edit(source.path, 0, 5, "A", "one", p.Safety.SAFE),
+            p.Edit(source.path, 11, 16, "G", "two", p.Safety.SAFE),
+        ]
+
+        assert p.EditPlanner.apply(source, edits) == "A beta G"
+
+    def test_rejects_overlapping_edits(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "abcdef")
+        edits = [
+            p.Edit(source.path, 1, 4, "X", "one", p.Safety.SAFE),
+            p.Edit(source.path, 3, 5, "Y", "two", p.Safety.SAFE),
+        ]
+
+        with pytest.raises(p.EditConflictError, match="overlap"):
+            p.EditPlanner.apply(source, edits)
+
+    @pytest.mark.parametrize("start,end", [(-1, 1), (3, 2), (0, 99)])
+    def test_rejects_invalid_ranges(self, tmp_path, start, end):
+        source = p.SourceFile(tmp_path / "main.tex", "abc")
+        edit = p.Edit(
+            source.path, start, end, "", "bad", p.Safety.SAFE,
+        )
+
+        with pytest.raises(ValueError, match="invalid edit range"):
+            p.EditPlanner.apply(source, [edit])
+
+    def test_rejects_edit_for_another_file(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "abc")
+        edit = p.Edit(
+            tmp_path / "other.tex", 0, 1, "x", "bad", p.Safety.SAFE,
+        )
+
+        with pytest.raises(ValueError, match="different source file"):
+            p.EditPlanner.apply(source, [edit])
+
+
 class TestFindMatchingBrace:
     def test_simple(self):
         assert p.find_matching_brace("{abc}", 0) == 4

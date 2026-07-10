@@ -202,6 +202,58 @@ class LatexDocument:
         return text
 
 
+class EditConflictError(ValueError):
+    pass
+
+
+class EditPlanner:
+    @staticmethod
+    def validate(source: SourceFile, edits: Iterable[Edit]) -> list[Edit]:
+        ordered = sorted(edits, key=lambda edit: (edit.start, edit.end))
+        previous: Edit | None = None
+        for edit in ordered:
+            if edit.file != source.path:
+                raise ValueError(
+                    f"edit for different source file: "
+                    f"{edit.file} != {source.path}"
+                )
+            if (
+                edit.start < 0
+                or edit.end < edit.start
+                or edit.end > len(source.content)
+            ):
+                raise ValueError(
+                    f"invalid edit range {edit.start}:{edit.end} "
+                    f"for {source.path}"
+                )
+            if previous is not None and (
+                edit.start < previous.end
+                or (
+                    edit.start == edit.end
+                    and previous.start == previous.end
+                    and edit.start == previous.start
+                )
+            ):
+                raise EditConflictError(
+                    f"overlap between {previous.pass_name} "
+                    f"and {edit.pass_name} in {source.path}"
+                )
+            previous = edit
+        return ordered
+
+    @classmethod
+    def apply(cls, source: SourceFile, edits: Iterable[Edit]) -> str:
+        ordered = cls.validate(source, edits)
+        content = source.content
+        for edit in reversed(ordered):
+            content = (
+                content[:edit.start]
+                + edit.replacement
+                + content[edit.end:]
+            )
+        return content
+
+
 _ALGO_CMD_NAMES = (
     "Require", "Ensure", "State", "For", "EndFor", "ForAll",
     "If", "ElsIf", "Else", "EndIf",
