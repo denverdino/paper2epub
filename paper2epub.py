@@ -972,9 +972,9 @@ def extract_abstract(main_tex: Path) -> str:
     return ""
 
 
-def extract_section_headings(paper_dir: Path) -> list[str]:
+def extract_section_headings(tex_files: list[Path]) -> list[str]:
     headings = []
-    for tex in paper_dir.glob("*.tex"):
+    for tex in tex_files:
         for m in re.finditer(
             r"\\(?:sub)*section\*?\{([^}]+)\}", tex.read_text(errors="replace")
         ):
@@ -991,7 +991,8 @@ def extract_glossary(
         "1. 提取所有重要的技术术语、方法名、概念\n"
         "2. 专有名词（模型名、数据集名、人名）标注为'保留英文'\n"
         "3. 输出格式为每行一个：English term | 中文翻译\n"
-        "4. 只输出术语表，不要其他内容"
+        "4. 只输出术语表，不要其他内容\n"
+        "5. 最多提取 50 个最重要的术语"
     )
     user_prompt = (
         f"标题：{title or '未知'}\n摘要：{abstract}\n章节标题：{', '.join(headings)}"
@@ -1157,7 +1158,23 @@ def _translate_heading_texts(client, glossary: str, texts: list[str]) -> dict[in
     return _parse_numbered_response(raw)
 
 
-def _translate_headings(client, glossary: str, content: str) -> str:
+def _build_heading_translations(
+    client, glossary: str, headings: list[str]
+) -> dict[str, str]:
+    unique_titles = list(dict.fromkeys(headings))
+    if not unique_titles:
+        return {}
+
+    print(f"Translating {len(unique_titles)} section headings ...")
+    translations = _translate_heading_texts(client, glossary, unique_titles)
+    return {
+        title: translations[i]
+        for i, title in enumerate(unique_titles)
+        if i in translations
+    }
+
+
+def _translate_headings(heading_translations: dict[str, str], content: str) -> str:
     heading_re = re.compile(
         r"\\(?:section|subsection|subsubsection)\*?(?:\[[^\]]*\])?\{"
     )
@@ -1175,19 +1192,8 @@ def _translate_headings(client, glossary: str, content: str) -> str:
             insert_pos += label_m.end()
         headings.append((insert_pos, title_text))
 
-    if not headings:
-        return content
-
-    unique_titles = list(dict.fromkeys(h[1] for h in headings))
-    print(f"Translating {len(unique_titles)} section headings ...")
-    translations = _translate_heading_texts(client, glossary, unique_titles)
-    title_to_zh = {}
-    for i, title in enumerate(unique_titles):
-        if i in translations:
-            title_to_zh[title] = translations[i]
-
     for insert_pos, title_text in reversed(headings):
-        zh = title_to_zh.get(title_text)
+        zh = heading_translations.get(title_text)
         if not zh:
             continue
         content = content[:insert_pos] + f"\n\n{zh}\n" + content[insert_pos:]
@@ -1195,7 +1201,9 @@ def _translate_headings(client, glossary: str, content: str) -> str:
     return content
 
 
-def translate_file_content(client, glossary: str, content: str) -> str:
+def translate_file_content(
+    client, glossary: str, heading_translations: dict[str, str], content: str
+) -> str:
     skip_ranges = _find_skip_ranges(content)
     chunks = _split_into_chunks(content)
 
@@ -1221,7 +1229,7 @@ def translate_file_content(client, glossary: str, content: str) -> str:
             numbered[i] = stripped
 
     if not numbered:
-        return _translate_headings(client, glossary, content)
+        return _translate_headings(heading_translations, content)
 
     translations = _batch_translate(client, glossary, numbered)
 
@@ -1232,20 +1240,19 @@ def translate_file_content(client, glossary: str, content: str) -> str:
             result.append(translations[i])
 
     assembled = "\n\n".join(result)
-    return _translate_headings(client, glossary, assembled)
+    return _translate_headings(heading_translations, assembled)
 
 
 def translate_tex_files(
     paper_dir: Path, main_tex: Path, client, title: str | None
 ) -> None:
-    abstract = extract_abstract(main_tex)
-    headings = extract_section_headings(paper_dir)
-    glossary = extract_glossary(client, title, abstract, headings)
-
     input_files = get_input_order(main_tex)
-    has_input_files = len(input_files) > 1
+    abstract = extract_abstract(main_tex)
+    headings = extract_section_headings(input_files)
+    glossary = extract_glossary(client, title, abstract, headings)
+    heading_translations = _build_heading_translations(client, glossary, headings)
 
-    files_to_translate = input_files[1:] if has_input_files else [main_tex]
+    files_to_translate = input_files
 
     def translate_one(tex_file: Path) -> str:
         content = tex_file.read_text(errors="replace")
@@ -1257,8 +1264,17 @@ def translate_tex_files(
             preamble = ""
             body = content
 
-        translated_body = translate_file_content(client, glossary, body)
-        result = preamble + translated_body
+        doc_end = re.search(r"\\end\{document\}", body)
+        if doc_end:
+            suffix = body[doc_end.start() :]
+            body = body[: doc_end.start()]
+        else:
+            suffix = ""
+
+        translated_body = translate_file_content(
+            client, glossary, heading_translations, body
+        )
+        result = preamble + translated_body + suffix
         tex_file.write_text(result)
         return tex_file.name
 

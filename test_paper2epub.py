@@ -900,6 +900,61 @@ class TestDingMap:
 # ── Translation helpers ────────────────────────────────────────────────────
 
 
+class TestExtractGlossary:
+    def test_limits_glossary_to_fifty_terms(self, monkeypatch):
+        prompts = []
+
+        def fake_chat(client, system_prompt, user_prompt):
+            prompts.append(system_prompt)
+            return "term | 术语"
+
+        monkeypatch.setattr(p, "_chat", fake_chat)
+
+        assert p.extract_glossary(object(), "Title", "Abstract", ["Intro"])
+        assert "最多提取 50 个" in prompts[0]
+
+
+class TestTranslateTexFiles:
+    def test_translates_main_body_and_deduplicates_headings(
+        self, tmp_path, monkeypatch
+    ):
+        main = tmp_path / "main.tex"
+        child = tmp_path / "child.tex"
+        main.write_text(
+            "\\documentclass{article}\n\\begin{document}\n"
+            "\\section{Intro}\nMain body with enough prose.\n"
+            "\\input{child}\n\\end{document}\n"
+        )
+        child.write_text("\\section{Intro}\nChild body with enough prose.\n")
+        heading_calls = []
+        translated_bodies = []
+
+        monkeypatch.setattr(p, "extract_glossary", lambda *args: "term | 术语")
+
+        def fake_heading_texts(client, glossary, texts):
+            heading_calls.append(texts)
+            return {0: "引言"}
+
+        def fake_translate(client, glossary, heading_map, content):
+            translated_bodies.append(content)
+            assert heading_map == {"Intro": "引言"}
+            return content + "\n译文"
+
+        monkeypatch.setattr(p, "_translate_heading_texts", fake_heading_texts)
+        monkeypatch.setattr(p, "translate_file_content", fake_translate)
+
+        p.translate_tex_files(tmp_path, main, object(), "Title")
+
+        assert heading_calls == [["Intro"]]
+        assert len(translated_bodies) == 2
+        assert "Main body" in main.read_text()
+        assert main.read_text().count("译文") == 1
+        assert main.read_text().index("译文") < main.read_text().index(
+            r"\end{document}"
+        )
+        assert child.read_text().count("译文") == 1
+
+
 class TestIsProse:
     def test_normal_text(self):
         assert p._is_prose("This is a normal paragraph with enough text to pass.")
