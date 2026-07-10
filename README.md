@@ -20,7 +20,9 @@ EMAIL_FROM=you@gmail.com EMAIL_TO=recipient@example.com EMAIL_PASSWORD=app-passw
   uv run paper2epub.py 2402.08954 --email
 ```
 
-Python 依赖（`pypdfium2`、`openai`）通过 PEP 723 内联元数据声明，`uv run` 会自动在隔离环境中安装，无需手动 `pip install`。
+Python 依赖（包括 `pypdfium2`、`Pillow`、`openai`、`PySocks`、
+`httpx[socks]` 和 `pylatexenc>=2.10,<3`）通过 PEP 723 内联元数据声明，
+`uv run` 会自动在隔离环境中安装，无需手动 `pip install`。
 
 脚本会从 arxiv.org 下载 LaTeX 源码压缩包，解压到 `paper/` 目录，找到主 `.tex` 文件，通过 pandoc 转换生成 `<arxiv-id>.epub`。
 
@@ -96,6 +98,7 @@ sudo apt install curl
 | `EMAIL_TO` | `--email` 模式必需，收件人邮箱地址 |
 | `SMTP_SSL_HOST` | SMTP 服务器地址，默认 `smtp.gmail.com` |
 | `SMTP_SSL_PORT` | SMTP SSL 端口，默认 `465` |
+| `SMTP_PROXY` | `--email` 可选 SOCKS5 代理，格式为 `socks5://[user:pass@]host:port` |
 | `https_proxy` | 代理配置，脚本通过 `curl` 下载，支持标准代理环境变量 |
 
 ```bash
@@ -108,15 +111,41 @@ uv run paper2epub.py 2402.08954
 
 1. 下载并解压 arXiv 源码压缩包
 2. 查找主 `.tex` 文件（匹配 `\documentclass` 或 `\begin{document}`）
-3. 简化 `\documentclass` 以兼容 pandoc
-4. 提取论文标题和作者（支持宏展开）
-5. 通过 pypdfium2 将 PDF 图片转换为 PNG
-6. 将 `.tex` 文件中的 `.pdf` 图片引用改写为 `.png`
-7. 解析 LaTeX 交叉引用（`\ref`、`\autoref`、`\cref`、`\eqref`）
-8. 预处理 algorithm/algorithmic 环境为 pandoc 可处理的格式
-9. （可选）通过 Qwen3.6-Flash 翻译为中文，采用两阶段策略：术语表提取 → 上下文感知段落翻译
-10. 运行 pandoc 生成 EPUB3
-11. （可选）通过 SMTP SSL 发送 EPUB 到指定邮箱
+3. 使用 `pylatexenc` 解析关键 LaTeX 命令及参数范围
+4. 通过安全的 edit planning 简化 `\documentclass`、移除 `\maketitle`
+5. 清理不兼容的宏包、排版噪声和注释系统
+6. 提取论文标题和作者（支持宏展开）
+7. 通过 pypdfium2 将 PDF 图片转换为 PNG，并改写显式 `.pdf` 引用
+8. 标准化引用、超链接、表格、定理、代码清单和算法环境
+9. 按引用文件目录优先、论文根目录次之解析 `\input`/`\include`，补全可确认存在的 `.tex` 扩展名
+10. （可选）通过 Qwen3.6-Flash 翻译为中文，采用两阶段策略：术语表提取 → 上下文感知段落翻译
+11. 运行 pandoc 和 Lua filter 生成 EPUB3
+12. （可选）通过 SMTP SSL 发送 EPUB 到指定邮箱
+
+## 结构化预处理与容错
+
+脚本对关键结构使用 `pylatexenc`，而不是仅依赖正则表达式查找命令边界：
+
+- `LatexDocument` 提供命令、环境和参数的稳定源码范围；
+- `LatexNodeRef` 与 `LatexArgumentRef` 标记语法是否完整，以及是否位于不可信的 `opaque` 范围；
+- 安全预处理先生成不可变 `Edit`，再由 `EditPlanner` 检查越界、跨文件和重叠冲突后统一应用；
+- 未闭合参数及其内部命令不会被 `Safety.SAFE` pass 改写，避免容错解析误删论文正文；
+- 嵌套目录中的 `\input{other}` 会优先相对当前 `.tex` 文件解析。
+
+目前文档类简化和 `\maketitle` 移除已经迁移到上述结构化流程；其他兼容性 pass
+仍按独立的纯文本 transform 运行，并由测试覆盖。
+
+## 测试
+
+测试不会访问网络或翻译 API。运行完整测试：
+
+```bash
+uv run --with pytest --with 'pylatexenc>=2.10,<3' \
+  python -m pytest test_paper2epub.py -q
+```
+
+当前测试覆盖解析器契约、完整/不完整参数、opaque 范围传播、edit 冲突检查、
+结构化 documentclass pass、嵌套 input 路径以及原有转换兼容逻辑。
 
 ## 输出格式
 
@@ -133,4 +162,6 @@ uv run paper2epub.py 2402.08954
 | `paper2epub.py` | 主脚本 |
 | `epub.css` | EPUB 排版样式表 |
 | `filter.lua` | pandoc Lua 过滤器（图表编号、交叉引用处理） |
+| `test_paper2epub.py` | 无网络单元测试与回归测试 |
+| `AGENTS.md` | 面向代码代理的架构、约束和测试说明 |
 | `paper/` | 临时工作目录，每次运行时重建 |

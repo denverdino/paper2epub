@@ -24,12 +24,15 @@ With `--translate`, it uses Alibaba Bailian's Qwen3.6-Flash model to translate t
 
 1. Download and extract arXiv source tarball
 2. Find the main `.tex` file (looks for `\documentclass` or `\begin{document}`)
-3. Simplify document class and strip problematic packages/noise
-4. Run TeX preprocessing passes (citations, hyperref, tables, algorithms, theorems, etc.)
+3. Parse selected LaTeX commands with `pylatexenc`, then safely simplify the
+   document class and remove `\maketitle`
+4. Strip incompatible packages, configuration, layout noise, and annotation helpers
 5. Extract paper title and authors (with macro expansion)
 6. Convert PDF figures to PNG via pypdfium2, rewrite image references
-7. (Optional) Translate to Chinese via Qwen3.6-Flash with two-phase strategy: glossary extraction → concurrent paragraph translation
-8. Run pandoc to produce EPUB3
+7. Normalize citations, hyperref, tables, figures, theorems, listings, and algorithms
+8. (Optional) Translate to Chinese via Qwen3.6-Flash with two-phase strategy: glossary extraction → concurrent paragraph translation
+9. Resolve `\input`/`\include` targets and append confirmed `.tex` extensions
+10. Run pandoc to produce EPUB3
 
 Reference: https://info.arxiv.org/help/submit_tex.html and https://info.arxiv.org/help/submit_latex_best_practices.html
 
@@ -49,7 +52,9 @@ uv run --with pytest --with 'pylatexenc>=2.10,<3' python -m pytest test_paper2ep
 ```
 
 - All tests live in `test_paper2epub.py`. No network or API calls — tests use `tmp_path` for filesystem operations.
-- **Test every `_content` pure function.** If you add a new preprocessing pass, add tests for its `_*_content` function.
+- **Test every pure transform or planner.** If you add a legacy preprocessing
+  pass, test its `_*_content` function. For syntax-aware passes, test planned
+  edits, safety gates, malformed input, and idempotence.
 - Tests are organized by class: `TestFindMatchingBrace`, `TestExtractBraceArg`, etc. — follow this pattern.
 - When modifying any content transform, run tests to verify no regressions.
 
@@ -60,20 +65,43 @@ uv run --with pytest --with 'pylatexenc>=2.10,<3' python -m pytest test_paper2ep
 - **Single-file script** — all logic lives in `paper2epub.py`. Keep it that way.
 - **Avoid module-level mutable state.** `_algorithm_counter` is a known exception — don't add more.
 - **Keep preprocessing passes independent.** Each pass handles one concern (citations, hyperref, tables, etc.) and can run in any order.
+- **Use syntax-aware edits for structural LaTeX.** `LatexDocument` wraps
+  `pylatexenc`; `LatexNodeRef`/`LatexArgumentRef` expose repository-owned
+  source ranges and completeness metadata without leaking parser nodes.
+- **Treat incomplete syntax conservatively.** A node inside an incomplete
+  group is `opaque`; `Safety.SAFE` passes must leave incomplete or opaque
+  ranges unchanged.
+- **Plan before writing.** Syntax-aware passes return immutable `Edit` values;
+  `EditPlanner` validates file ownership, ranges, and overlap before applying
+  edits in reverse source order.
 - **Files:** `paper2epub.py` (main script), `filter.lua` (pandoc Lua filter for refs/captions), `epub.css` (EPUB styling), `test_paper2epub.py` (tests).
 
-### Two-tier function pattern
+### Preprocessing function patterns
 
-Every TeX preprocessing pass follows this convention:
+Legacy text transforms follow this convention:
 1. A **pure transform** function named `_<operation>_content(content: str) -> str` — testable with no filesystem access.
 2. A **file-level wrapper** named `<operation>(paper_dir: Path)` — a one-liner calling `_transform_tex_files`.
 
 Example: `_strip_noise_content` (pure) → `strip_noise_commands` (file-level wrapper). When adding a new pass, follow this pattern.
 
+Structural transforms should instead use:
+1. A pure planner receiving `SourceFile`, `LatexDocument`, and any required
+   path context, returning `list[Edit]`.
+2. A file-level wrapper that parses once, applies edits through `EditPlanner`,
+   and writes only when the content changed.
+
+Example: `plan_simplify_documentclass` → `simplify_documentclass`.
+Prefer this syntax-aware pattern for commands, arguments, environments, or
+nested structures; do not add new Regex-based structural parsing.
+
 ### Reusable utilities — use these instead of writing ad-hoc logic
 
 | Utility | Purpose | Don't reinvent |
 |---|---|---|
+| `SourceFile.from_path(path)` | Read TeX with `errors="replace"` and retain its path | Direct non-tolerant TeX reads |
+| `LatexDocument(source)` | Query parsed commands/environments and stable argument/source ranges | Regex command/environment boundary detection |
+| `LatexNodeRef.complete` / `.opaque` | Gate safe rewrites on trustworthy syntax | Per-pass malformed-input guesses |
+| `EditPlanner.apply(source, edits)` | Validate and apply non-overlapping source edits | Direct multi-edit string slicing |
 | `_transform_tex_files(paper_dir, transform, label, *, guard, glob)` | Iterate/read/transform/write/print boilerplate for all TeX files | File-walking + write-if-changed loops |
 | `find_matching_brace(text, start)` | Find closing `}` for an opening `{` at `start` | Inline brace-depth counting loops |
 | `find_matching_bracket(text, start)` | Same for `[…]` pairs | Inline bracket-depth loops |
@@ -92,9 +120,14 @@ Pass `guard="\\commandname"` to `_transform_tex_files` to skip files that don't 
 ### Conventions
 
 - **Read TeX files with `errors="replace"`** — arXiv sources may contain non-UTF-8 bytes.
+- **Test syntax-aware passes at the planning layer.** Assert generated edits,
+  safety level, idempotence, and preservation of incomplete/opaque input.
 - **Use `SCRIPT_DIR`** (`Path(__file__).resolve().parent`) to resolve paths relative to the script (e.g. `epub.css`, `filter.lua`).
 - **Translation uses `openai` SDK** against Alibaba Bailian's API (`DASHSCOPE_BASE_URL`). The `_chat` helper wraps single-turn completions.
 - **Multi-file TeX documents** — use `get_input_order(main_tex)` to walk `\input`/`\include` trees in document order.
+- **Input extension normalization is path-aware.**
+  `_normalize_input_extensions_content` resolves targets relative to the
+  referencing `.tex` file first, then the paper root.
 
 ## Key Details
 
