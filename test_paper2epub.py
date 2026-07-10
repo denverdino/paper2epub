@@ -955,6 +955,15 @@ class TestTranslateHeadings:
         assert r"\paragraph{贡献。}" not in result
         assert r"\label{para:contrib}" + "\n\n贡献。\n" in result
 
+    def test_skips_paragraph_inside_incomplete_outer_command(self):
+        content = (
+            r"\paragraph{Shared}" + "\n\n" + r"\section{Outer \paragraph{Shared}"
+        )
+
+        result = p._translate_headings({"Shared": "共享"}, content)
+
+        assert result.count("共享") == 1
+
 
 class TestTranslateFileContent:
     def test_paragraph_heading_is_not_duplicated(self, monkeypatch):
@@ -1097,6 +1106,13 @@ class TestStripHeadingLines:
         result = p._strip_heading_lines(text)
 
         assert "Contributions" not in result
+        assert result == "Body text."
+
+    def test_preserves_prose_after_paragraph_on_same_line(self):
+        text = r"\paragraph{Contributions.} Body text."
+
+        result = p._strip_heading_lines(text)
+
         assert result == "Body text."
 
     def test_preserves_non_heading(self):

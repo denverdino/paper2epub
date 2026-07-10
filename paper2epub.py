@@ -1027,8 +1027,25 @@ def extract_glossary(
 
 
 def _strip_heading_lines(text: str) -> str:
-    lines = text.splitlines()
-    return "\n".join(l for l in lines if not SECTION_HEADING_LINE_RE.match(l)).strip()
+    result = []
+    for line in text.splitlines():
+        match = SECTION_HEADING_LINE_RE.match(line)
+        if not match:
+            result.append(line)
+            continue
+
+        brace_start = match.end() - 1
+        brace_end = find_matching_brace(line, brace_start)
+        if brace_end is None:
+            continue
+        remainder = line[brace_end + 1 :]
+        label_match = re.match(r"\s*\\label\{[^}]*\}", remainder)
+        if label_match:
+            remainder = remainder[label_match.end() :]
+        if remainder := remainder.lstrip():
+            result.append(remainder)
+
+    return "\n".join(result).strip()
 
 
 def _is_prose(chunk: str) -> bool:
@@ -1214,17 +1231,29 @@ def _build_heading_translations(
 
 
 def _translate_headings(heading_translations: dict[str, str], content: str) -> str:
-    heading_re = re.compile(
-        r"\\(?:section|subsection|subsubsection|paragraph)\*?(?:\[[^\]]*\])?\{"
+    source = SourceFile(Path("<translated-content>"), content)
+    document = LatexDocument(source)
+    refs = sorted(
+        (
+            ref
+            for name in (
+                "section",
+                "subsection",
+                "subsubsection",
+                "paragraph",
+            )
+            for ref in document.commands(name)
+        ),
+        key=lambda ref: ref.start,
     )
     headings = []
-    for m in heading_re.finditer(content):
-        brace_start = m.end() - 1
-        brace_end = find_matching_brace(content, brace_start)
-        if brace_end is None:
+    for ref in refs:
+        if not ref.complete or ref.opaque:
             continue
-        title_text = content[brace_start + 1 : brace_end]
-        insert_pos = brace_end + 1
+        title_text = document.argument_text(ref, 0)
+        if title_text is None:
+            continue
+        insert_pos = ref.end
         rest = content[insert_pos:]
         label_m = re.match(r"\s*\\label\{[^}]*\}", rest)
         if label_m:
