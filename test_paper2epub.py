@@ -1,7 +1,9 @@
 """Unit tests for paper2epub.py — pure-function coverage, no network/API calls."""
 
+from dataclasses import FrozenInstanceError, replace
 import shutil
 import subprocess
+import sys
 
 import pytest
 from pathlib import Path
@@ -31,6 +33,44 @@ class TestSourceAndEditTypes:
 
         with pytest.raises(AttributeError):
             edit.start = 1
+
+
+class TestPassSpec:
+    def test_pass_spec_records_declarative_contract(self):
+        planner = lambda snapshot: []
+
+        spec = p.PassSpec(
+            name="normalize",
+            planner=planner,
+            phase=p.Phase.SAFE_NORMALIZATION,
+            safety=p.Safety.SAFE,
+            requires=frozenset({p.Fact.SYNTAX}),
+            invalidates=frozenset({p.Fact.SYNTAX}),
+            after=frozenset({"discover"}),
+            report_label="Normalized",
+        )
+
+        assert spec.planner is planner
+        assert spec.requires == frozenset({p.Fact.SYNTAX})
+        assert spec.implementation is p.Implementation.SYNTAX_AWARE
+        assert spec.idempotent is False
+
+    def test_pass_spec_is_immutable(self):
+        spec = p.PassSpec(
+            name="normalize",
+            planner=lambda snapshot: [],
+            phase=p.Phase.SAFE_NORMALIZATION,
+            safety=p.Safety.SAFE,
+            requires=frozenset(),
+            invalidates=frozenset(),
+        )
+
+        with pytest.raises(FrozenInstanceError):
+            spec.name = "changed"
+
+    def test_phase_order_is_explicit(self):
+        assert p.Phase.DISCOVERY < p.Phase.SAFE_NORMALIZATION
+        assert p.Phase.SAFE_NORMALIZATION < p.Phase.COMPATIBILITY
 
 
 class TestLatexDocument:
@@ -75,6 +115,21 @@ class TestLatexDocument:
 
         assert document.argument_text(image, 0) is None
         assert document.argument_text(image, 1) == "figs/a.pdf"
+
+    def test_starred_resizebox_exposes_parser_owned_arguments(self, tmp_path):
+        content = r"\resizebox*{1cm}{!}{nested {body}}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        document = p.LatexDocument(source)
+        ref = document.commands("resizebox")[0]
+
+        assert document.source_text(ref) == content
+        assert len(ref.arguments) == 4
+        assert ref.arguments[0] is not None
+        assert ref.arguments[0].text == "*"
+        assert [document.argument_text(ref, index) for index in range(3)] == [
+            "1cm", "!", "nested {body}",
+        ]
 
     def test_complete_arguments_expose_stable_ranges_and_metadata(self, tmp_path):
         content = r"\includegraphics[width=.8\linewidth]{figs/a.pdf}"
@@ -181,7 +236,1168 @@ class TestLatexDocument:
         assert document.argument_text(section, 0) == "Long"
 
 
+class TestLatexEnvironmentContract:
+    def test_exposes_nested_environment_body_ranges(self, tmp_path):
+        content = (
+            r"A\begin{comment}outer "
+            r"\begin{comment}inner\end{comment} tail\end{comment}Z"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        document = p.LatexDocument(source)
+        outer, inner = document.environments("comment")
+
+        assert document.source_text(outer) == content[1:-1]
+        assert source.content[outer.body_start:outer.body_end] == (
+            r"outer \begin{comment}inner\end{comment} tail"
+        )
+        assert outer.start < inner.start < inner.end < outer.end
+        assert source.content[outer.end_token_start:outer.end] == r"\end{comment}"
+
+    def test_unclosed_environment_is_opaque_and_diagnostic(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex", r"\begin{comment}unfinished"
+        )
+        document = p.LatexDocument(source)
+        ref = document.environments("comment")[0]
+
+        assert not ref.complete
+        assert ref.opaque
+        assert any(d.code == "incomplete-environment" for d in document.diagnostics)
+
+    def test_unmatched_optional_environment_argument_propagates_opacity(
+        self, tmp_path
+    ):
+        content = (
+            r"\begin{minipage}[t{.5\linewidth}"
+            r"before \textbf{inside}\end{minipage}"
+        )
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        minipage = document.environments("minipage")[0]
+        bold = document.commands("textbf")[0]
+
+        assert minipage.complete is False
+        assert minipage.opaque is True
+        assert bold.complete is True
+        assert bold.opaque is True
+
+    def test_valid_minipage_does_not_reuse_earlier_optional_argument(self, tmp_path):
+        content = (
+            r"\begin{minipage}[t]{.5\linewidth}"
+            r"body\end{minipage}"
+        )
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        minipage = document.environments("minipage")[0]
+
+        assert minipage.complete is True
+        assert minipage.opaque is False
+        assert (
+            minipage.begin_token_end
+            <= minipage.body_start
+            <= minipage.body_end
+            <= minipage.end_token_start
+        )
+
+
 # ── Brace matching ──────────────────────────────────────────────────────────
+
+
+class TestDocumentSnapshot:
+    def test_from_directory_reads_and_parses_all_tex_files(self, tmp_path):
+        main = tmp_path / "main.tex"
+        section = tmp_path / "sections" / "intro.tex"
+        section.parent.mkdir()
+        main.write_text(r"\documentclass{article}\input{sections/intro}")
+        section.write_text(r"\section{Intro}")
+
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+
+        assert snapshot.revision == 0
+        assert tuple(snapshot.sources) == (main, section)
+        assert snapshot.documents[main].commands("documentclass")
+        assert snapshot.documents[section].commands("section")
+        assert snapshot.current_facts == frozenset({p.Fact.SYNTAX})
+
+    def test_snapshot_mappings_are_read_only(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(r"\documentclass{article}")
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+
+        with pytest.raises(TypeError):
+            snapshot.sources[main] = p.SourceFile(main, "changed")
+
+        with pytest.raises(TypeError):
+            snapshot.documents[main] = p.LatexDocument(snapshot.sources[main])
+
+    def test_rebuild_syntax_keeps_revision_and_refreshes_documents(self, tmp_path):
+        main = tmp_path / "main.tex"
+        source = p.SourceFile(main, r"\section{Fresh}")
+        stale = p.DocumentSnapshot(
+            root=tmp_path,
+            main_tex=main,
+            revision=3,
+            sources=p.read_only_mapping({main: source}),
+            documents=p.read_only_mapping({}),
+            current_facts=frozenset(),
+        )
+
+        rebuilt = p.rebuild_syntax(stale)
+
+        assert rebuilt.revision == 3
+        assert rebuilt.documents[main].argument_text(
+            rebuilt.documents[main].commands("section")[0], 0
+        ) == "Fresh"
+        assert rebuilt.current_facts == frozenset({p.Fact.SYNTAX})
+
+
+class TestDiscoveryFacts:
+    def test_captures_metadata_before_cleanup(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\documentclass{article}"
+            r"\newcommand{\paperword}{Robust}"
+            r"\title{A \paperword{} Paper}"
+            r"\author{Ada Lovelace}"
+        )
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+
+        discovered = p.build_discovery_facts(snapshot)
+
+        assert discovered.discovery.title == "A Robust Paper"
+        assert discovered.discovery.authors == ("Ada Lovelace",)
+        assert discovered.discovery.macros["paperword"] == p.MacroDefinition(
+            "Robust"
+        )
+
+    def test_expands_macro_backed_authors_before_formatting(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\newcommand{\paperauthors}{Ada Lovelace, Alan Turing}"
+            r"\author{\paperauthors}"
+        )
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.authors == ("Ada Lovelace", "Alan Turing")
+
+    def test_formats_parser_owned_metadata_arguments(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\title[Short]{Line One \\ Learning $\mathcal{F}$ Spaces}"
+            r"\author{Alice, Bob \\ University}"
+        )
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.title == "Line One Learning $F$ Spaces"
+        assert facts.authors == ("Alice", "Bob")
+
+    def test_nested_macro_definition_is_not_truncated(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(r"\newcommand{\loss}{\textbf{L}_{\mathrm{nested}}}")
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.macros["loss"] == p.MacroDefinition(
+            r"\textbf{L}_{\mathrm{nested}}"
+        )
+
+    def test_collects_supported_complete_macro_declarations(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\providecommand{\provided}{P}"
+            r"\renewcommand*{\renewed}[1]{R #1}"
+            r"\DeclareRobustCommand{\robust}{Safe\xspace}"
+            r"\DeclareMathOperator*{\argmin}{arg\,min}"
+        )
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.macros == {
+            "provided": p.MacroDefinition("P"),
+            "renewed": p.MacroDefinition("R #1", parameter_count=1),
+            "robust": p.MacroDefinition("Safe"),
+            "argmin": p.MacroDefinition(r"arg\,min", math_operator=True),
+        }
+
+    def test_normalizes_math_operator_body_before_metadata_expansion(
+        self, tmp_path,
+    ):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\DeclareMathOperator{\op}{ arg\xspace }"
+            r"\title{The \op{} Result}"
+        )
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.macros["op"] == p.MacroDefinition(
+            "arg", math_operator=True
+        )
+        assert p.expand_macros(r"\op", facts.macros) == r"\operatorname{arg}"
+        assert facts.title == "The arg Result"
+
+    def test_collects_complete_dependency_and_metadata_references(self, tmp_path):
+        sections = tmp_path / "sections"
+        sections.mkdir()
+        main = tmp_path / "main.tex"
+        intro = sections / "intro.tex"
+        detail = sections / "detail.tex"
+        main.write_text(
+            r"\usepackage{amsmath, graphicx}"
+            r"\RequirePackage[final]{xcolor}"
+            r"\graphicspath{{figures/}{images/generated/}}"
+            r"\newtheorem{claim}{Special Claim}"
+            r"\begin{abstract}An {important} abstract.\end{abstract}"
+            r"\label{doc:start}"
+            r"\includegraphics[width=.8\linewidth]{figures/plot.pdf}"
+            r"\input{sections/intro}"
+        )
+        intro.write_text(r"\label{sec:intro}\include{detail}")
+        detail.write_text(r"\includegraphics{nested/image.png}")
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.abstract == "An {important} abstract."
+        assert facts.packages == ("amsmath", "graphicx", "xcolor")
+        assert facts.include_order == (main, intro, detail)
+        assert facts.graphicspaths == ("figures", "images/generated")
+        assert facts.resource_refs == (
+            (main, "figures/plot.pdf"),
+            (detail, "nested/image.png"),
+        )
+        assert facts.labels == {
+            "doc:start": (main, main.read_text().index(r"\label{doc:start}")),
+            "sec:intro": (intro, 0),
+        }
+        assert facts.theorem_labels == {"claim": "Special Claim"}
+
+    def test_ignores_commented_commands(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            "% \\newcommand{\\hidden}{Wrong}\n"
+            "% \\title{Commented}\n"
+            "% \\input{missing}\n"
+            r"\title{Visible}"
+        )
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.title == "Visible"
+        assert "hidden" not in facts.macros
+        assert facts.include_order == (main,)
+
+    def test_incomplete_definition_is_diagnosed_and_ignored(self, tmp_path):
+        main = tmp_path / "main.tex"
+        content = r"\newcommand{\broken}{unfinished"
+        main.write_text(content)
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+
+        facts = p.build_discovery_facts(snapshot).discovery
+
+        assert "broken" not in facts.macros
+        assert snapshot.sources[main].content == content
+        assert any(
+            diagnostic.code == "incomplete-command"
+            and diagnostic.start == 0
+            for diagnostic in snapshot.documents[main].diagnostics
+        )
+
+    def test_include_cycle_terminates_in_document_order(self, tmp_path):
+        nested = tmp_path / "chapters"
+        nested.mkdir()
+        main = tmp_path / "main.tex"
+        first = nested / "first.tex"
+        second = nested / "second.tex"
+        main.write_text(r"\input{chapters/first}")
+        first.write_text(r"\input{second}")
+        second.write_text(r"\include{../main}")
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.include_order == (main, first, second)
+
+    def test_discovery_mappings_are_read_only(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(r"\newcommand{\word}{value}\label{one}")
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        with pytest.raises(TypeError):
+            facts.macros["other"] = "changed"
+        with pytest.raises(TypeError):
+            facts.labels["two"] = (main, 0)
+
+    def test_pipeline_builds_discovery_once_and_preserves_it_after_cleanup(
+        self, tmp_path,
+    ):
+        main = tmp_path / "main.tex"
+        main.write_text(r"\title{Original}\documentclass{custom}")
+        spec = p.make_syntax_file_pass(
+            name="cleanup",
+            planner=p.plan_simplify_documentclass,
+            safety=p.Safety.LOSSY,
+            main_only=True,
+        )
+
+        result = p.PassPipeline([spec]).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert result.executions[0].rebuilt_before == frozenset({p.Fact.DISCOVERY})
+        assert result.snapshot.discovery.title == "Original"
+        assert p.Fact.DISCOVERY in result.snapshot.current_facts
+
+    def test_pipeline_rebuilds_syntax_before_discovery_when_both_are_stale(
+        self, tmp_path,
+    ):
+        main = tmp_path / "main.tex"
+        source = p.SourceFile(main, r"\title{Recovered}")
+        stale = p.DocumentSnapshot(
+            root=tmp_path,
+            main_tex=main,
+            revision=2,
+            sources=p.read_only_mapping({main: source}),
+            documents=p.read_only_mapping({}),
+            current_facts=frozenset(),
+        )
+        spec = p.make_syntax_file_pass(
+            name="observe",
+            planner=lambda source, document: [],
+            safety=p.Safety.SAFE,
+        )
+
+        result = p.PassPipeline([spec]).run(stale)
+
+        assert result.executions[0].rebuilt_before == frozenset({
+            p.Fact.SYNTAX, p.Fact.DISCOVERY,
+        })
+        assert result.snapshot.discovery.title == "Recovered"
+
+
+class TestParameterizedMacroDiscovery:
+    @pytest.mark.parametrize(
+        "definitions",
+        [
+            r"\renewcommand{\choice}{FIRST}\newcommand{\choice}{SECOND}",
+            r"\newcommand{\choice}{FIRST}\renewcommand{\choice}{SECOND}",
+        ],
+    )
+    def test_first_definition_wins_across_kinds_in_source_order(
+        self, tmp_path, definitions,
+    ):
+        main = tmp_path / "main.tex"
+        main.write_text(definitions)
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.macros["choice"] == p.MacroDefinition("FIRST")
+
+    def test_main_definition_wins_over_included_and_detached_files(
+        self, tmp_path,
+    ):
+        main = tmp_path / "main.tex"
+        included = tmp_path / "included.tex"
+        detached = tmp_path / "detached.tex"
+        main.write_text(
+            r"\newcommand{\choice}{MAIN}\input{included}"
+        )
+        included.write_text(r"\newcommand{\choice}{INCLUDED}")
+        detached.write_text(r"\newcommand{\choice}{DETACHED}")
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.include_order == (main, included)
+        assert facts.macros["choice"] == p.MacroDefinition("MAIN")
+
+    def test_included_definition_wins_over_detached_file_when_main_has_none(
+        self, tmp_path,
+    ):
+        main = tmp_path / "main.tex"
+        included = tmp_path / "included.tex"
+        detached = tmp_path / "detached.tex"
+        main.write_text(r"\input{included}")
+        included.write_text(r"\newcommand{\choice}{INCLUDED}")
+        detached.write_text(r"\newcommand{\choice}{DETACHED}")
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.include_order == (main, included)
+        assert facts.macros["choice"] == p.MacroDefinition("INCLUDED")
+
+    def test_records_parameter_count_default_and_body(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\documentclass{article}"
+            r"\newcommand{\update}[1]{#1}"
+            r"\newcommand{\named}[2][Default]{#1/#2}"
+            r"\begin{document}\end{document}"
+        )
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert snapshot.discovery.macros["update"] == p.MacroDefinition(
+            body="#1", parameter_count=1
+        )
+        assert snapshot.discovery.macros["named"] == p.MacroDefinition(
+            body="#1/#2", parameter_count=2, optional_default="Default"
+        )
+
+    def test_rejects_invalid_counts_and_default_without_parameter(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\newcommand{\tooMany}[10]{#1}"
+            r"\newcommand{\invalid}[0][x]{x}"
+            r"\begin{document}\end{document}"
+        )
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        assert "tooMany" not in snapshot.discovery.macros
+        assert "invalid" not in snapshot.discovery.macros
+
+
+def _pass_spec(name, *, phase=p.Phase.SAFE_NORMALIZATION, after=(), before=()):
+    return p.PassSpec(
+        name=name,
+        planner=lambda snapshot: [],
+        phase=phase,
+        safety=p.Safety.SAFE,
+        requires=frozenset(),
+        invalidates=frozenset(),
+        after=frozenset(after),
+        before=frozenset(before),
+    )
+
+
+class TestResolvePassOrder:
+    def test_order_is_independent_of_registration_order(self):
+        specs = [
+            _pass_spec("third", after=("second",)),
+            _pass_spec("first"),
+            _pass_spec("second", after=("first",)),
+        ]
+
+        forward = p.resolve_pass_order(specs)
+        reverse = p.resolve_pass_order(reversed(specs))
+
+        assert [spec.name for spec in forward] == ["first", "second", "third"]
+        assert [spec.name for spec in reverse] == ["first", "second", "third"]
+
+    def test_earlier_phases_run_first_without_manual_edges(self):
+        specs = [
+            _pass_spec("compat", phase=p.Phase.COMPATIBILITY),
+            _pass_spec("discover", phase=p.Phase.DISCOVERY),
+            _pass_spec("safe", phase=p.Phase.SAFE_NORMALIZATION),
+        ]
+
+        assert [spec.name for spec in p.resolve_pass_order(specs)] == [
+            "discover", "safe", "compat",
+        ]
+
+    def test_missing_named_dependency_is_rejected(self):
+        with pytest.raises(p.PassDependencyError, match="missing.*unknown"):
+            p.resolve_pass_order([_pass_spec("only", after=("unknown",))])
+
+    def test_dependency_cycle_is_rejected(self):
+        specs = [
+            _pass_spec("left", after=("right",)),
+            _pass_spec("right", after=("left",)),
+        ]
+
+        with pytest.raises(p.PassDependencyError, match="cycle.*left.*right"):
+            p.resolve_pass_order(specs)
+
+    def test_duplicate_pass_name_is_rejected(self):
+        with pytest.raises(p.PassDependencyError, match="duplicate.*same"):
+            p.resolve_pass_order([_pass_spec("same"), _pass_spec("same")])
+
+
+class TestPassPipeline:
+    def test_reparses_after_a_pass_invalidates_syntax(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(r"\foo{Old}")
+
+        def introduce_section(snapshot):
+            source = snapshot.sources[main]
+            return [p.Edit(
+                main, 0, len(source.content), r"\section{Fresh}",
+                "introduce_section", p.Safety.SAFE,
+            )]
+
+        observed_revisions = []
+
+        def read_fresh_section(snapshot):
+            observed_revisions.append(snapshot.revision)
+            document = snapshot.documents[main]
+            section = document.commands("section")[0]
+            title = document.argument_text(section, 0)
+            return [p.Edit(
+                main, section.start, section.end, title,
+                "read_fresh_section", p.Safety.SAFE,
+            )]
+
+        specs = [
+            p.PassSpec(
+                "introduce_section", introduce_section,
+                p.Phase.SAFE_NORMALIZATION, p.Safety.SAFE,
+                frozenset({p.Fact.SYNTAX}),
+                frozenset({p.Fact.SYNTAX}),
+            ),
+            p.PassSpec(
+                "read_fresh_section", read_fresh_section,
+                p.Phase.SAFE_NORMALIZATION, p.Safety.SAFE,
+                frozenset({p.Fact.SYNTAX}),
+                frozenset({p.Fact.SYNTAX}),
+                after=frozenset({"introduce_section"}),
+            ),
+        ]
+
+        result = p.PassPipeline(specs).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert result.snapshot.sources[main].content == "Fresh"
+        assert result.snapshot.revision == 2
+        assert observed_revisions == [1]
+        assert result.executions[1].rebuilt_before == frozenset({p.Fact.SYNTAX})
+
+    def test_source_edit_must_invalidate_syntax(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text("old")
+
+        spec = p.PassSpec(
+            "bad", lambda snapshot: [p.Edit(
+                main, 0, 3, "new", "bad", p.Safety.SAFE,
+            )],
+            p.Phase.SAFE_NORMALIZATION, p.Safety.SAFE,
+            frozenset(), frozenset(),
+        )
+
+        with pytest.raises(p.PipelineContractError, match="invalidate syntax"):
+            p.PassPipeline([spec]).run(
+                p.DocumentSnapshot.from_directory(tmp_path, main)
+            )
+
+    def test_missing_fact_builder_is_rejected_at_construction(self):
+        spec = p.PassSpec(
+            "needs_macros", lambda snapshot: [],
+            p.Phase.DISCOVERY, p.Safety.SAFE,
+            frozenset({p.Fact.MACROS}), frozenset(),
+        )
+
+        with pytest.raises(p.PipelineContractError, match="no builder.*macros"):
+            p.PassPipeline([spec])
+
+    def test_overlapping_edits_fail_without_mutating_snapshot(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text("abcdef")
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+        spec = p.PassSpec(
+            "overlap", lambda current: [
+                p.Edit(main, 0, 3, "x", "one", p.Safety.SAFE),
+                p.Edit(main, 2, 5, "y", "two", p.Safety.SAFE),
+            ],
+            p.Phase.SAFE_NORMALIZATION, p.Safety.SAFE,
+            frozenset(), frozenset({p.Fact.SYNTAX}),
+        )
+
+        with pytest.raises(p.EditConflictError):
+            p.PassPipeline([spec]).run(snapshot)
+
+        assert snapshot.sources[main].content == "abcdef"
+        assert main.read_text() == "abcdef"
+
+    def test_edit_cannot_be_less_safe_than_pass_declaration(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text("old")
+        spec = p.PassSpec(
+            "unsafe", lambda snapshot: [p.Edit(
+                main, 0, 3, "new", "unsafe", p.Safety.LOSSY,
+            )],
+            p.Phase.SAFE_NORMALIZATION, p.Safety.SAFE,
+            frozenset(), frozenset({p.Fact.SYNTAX}),
+        )
+
+        with pytest.raises(p.PipelineContractError, match="LOSSY.*SAFE"):
+            p.PassPipeline([spec]).run(
+                p.DocumentSnapshot.from_directory(tmp_path, main)
+            )
+
+    def test_collects_skipped_edit_diagnostics_without_failing(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(r"\begin{adjustbox}{width=1cm}body")
+
+        def preserve_incomplete(snapshot):
+            source = snapshot.sources[main]
+            document = snapshot.documents[main]
+            return p.plan_unwrap_environment(
+                source,
+                document.environments("adjustbox")[0],
+                "preserve_incomplete",
+                p.Safety.LOSSY,
+            )
+
+        spec = p.PassSpec(
+            "preserve_incomplete", preserve_incomplete,
+            p.Phase.SAFE_NORMALIZATION, p.Safety.LOSSY,
+            frozenset({p.Fact.SYNTAX}), frozenset({p.Fact.SYNTAX}),
+        )
+
+        result = p.PassPipeline([spec]).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert result.snapshot.sources[main].content == (
+            r"\begin{adjustbox}{width=1cm}body"
+        )
+        assert [diagnostic.code for diagnostic in result.diagnostics] == [
+            "opaque-structure",
+        ]
+
+    def test_fallback_only_pass_is_skipped_by_default(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text("old")
+        calls = []
+
+        def fallback(snapshot):
+            calls.append(snapshot.revision)
+            return p.PlanOutcome(edits=(p.Edit(
+                main, 0, 3, "new", "fallback", p.Safety.FALLBACK_ONLY,
+            ),))
+
+        spec = p.PassSpec(
+            "fallback", fallback,
+            p.Phase.COMPATIBILITY, p.Safety.FALLBACK_ONLY,
+            frozenset(), frozenset({p.Fact.SYNTAX}),
+        )
+
+        result = p.PassPipeline([spec]).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert result.snapshot.sources[main].content == "old"
+        assert calls == []
+        assert result.diagnostics == ()
+
+    def test_enabled_fallback_records_execution_diagnostic(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text("old")
+        spec = p.PassSpec(
+            "fallback", lambda snapshot: p.PlanOutcome(edits=(p.Edit(
+                main, 0, 3, "new", "fallback", p.Safety.FALLBACK_ONLY,
+            ),)),
+            p.Phase.COMPATIBILITY, p.Safety.FALLBACK_ONLY,
+            frozenset(), frozenset({p.Fact.SYNTAX}),
+        )
+
+        result = p.PassPipeline([spec], fallback_enabled=True).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert result.snapshot.sources[main].content == "new"
+        assert result.diagnostics[-1].code == "fallback-executed"
+        assert result.diagnostics[-1].pass_name == "fallback"
+        assert result.diagnostics[-1].file == main
+        assert "fallback" in result.diagnostics[-1].message
+        assert str(main) in result.diagnostics[-1].message
+
+
+class TestPassAdapters:
+    def test_syntax_adapter_can_target_only_main_file(self, tmp_path):
+        main = tmp_path / "main.tex"
+        child = tmp_path / "child.tex"
+        main.write_text(r"\section{Main}")
+        child.write_text(r"\section{Child}")
+
+        def remove_sections(source, document):
+            return [p.Edit(
+                source.path, ref.start, ref.end, "",
+                "remove_sections", p.Safety.SAFE,
+            ) for ref in document.commands("section")]
+
+        spec = p.make_syntax_file_pass(
+            name="main_only",
+            planner=remove_sections,
+            safety=p.Safety.SAFE,
+            main_only=True,
+        )
+        result = p.PassPipeline([spec]).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert result.snapshot.sources[main].content == ""
+        assert result.snapshot.sources[child].content == r"\section{Child}"
+
+class TestInitialPreprocessingPipeline:
+    def test_declares_the_existing_initial_order(self):
+        specs = p.build_initial_preprocessing_passes()
+
+        assert [spec.name for spec in p.resolve_pass_order(specs)] == [
+            "simplify_documentclass",
+            "strip_problematic_packages",
+            "strip_noise_commands",
+            "strip_annotation_system",
+            "normalize_textsc",
+        ]
+
+    def test_cleanup_passes_are_syntax_aware_with_declared_safety(self):
+        specs = {
+            spec.name: spec for spec in p.build_initial_preprocessing_passes()
+        }
+
+        for name in (
+            "strip_problematic_packages",
+            "strip_noise_commands",
+            "strip_annotation_system",
+            "normalize_textsc",
+        ):
+            assert specs[name].implementation is p.Implementation.SYNTAX_AWARE
+        assert specs["strip_problematic_packages"].safety is p.Safety.LOSSY
+        assert specs["strip_noise_commands"].safety is p.Safety.LOSSY
+        assert specs["strip_annotation_system"].safety is p.Safety.LOSSY
+        assert specs["normalize_textsc"].safety is p.Safety.SAFE
+
+    def test_discovery_preserves_packages_before_cleanup(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(r"\usepackage{hyperref,amsmath}\begin{document}x")
+
+        result = p.PassPipeline(p.build_initial_preprocessing_passes()).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        assert result.snapshot.discovery.packages == ("hyperref", "amsmath")
+        assert "hyperref" not in result.snapshot.sources[main].content
+
+class TestCompletePreprocessingPlan:
+    expected = [
+        "discover", "simplify_documentclass", "strip_problematic_packages",
+        "strip_noise_commands", "strip_annotation_system", "normalize_textsc",
+        "convert_pdf_resources", "rewrite_pdf_image_refs", "normalize_citations",
+        "preprocess_hyperref", "normalize_table_envs", "unwrap_makecell",
+        "rewrite_captionof", "strip_minipage_in_tables", "strip_at_col_specs",
+        "normalize_siunitx_columns", "strip_resizebox", "strip_adjustbox",
+        "convert_wrapfigure", "unwrap_subfigures", "destar_floats",
+        "replace_ding_commands", "replace_textcircled", "preprocess_theorems",
+        "normalize_code_listings", "preprocess_algorithms", "translate",
+        "unnumber_paragraph_headings", "normalize_input_extensions",
+    ]
+
+    def test_declares_every_step_once_in_required_order(self):
+        translated = p.build_preprocessing_plan(True)
+        plain = p.build_preprocessing_plan(False)
+
+        assert [step.name for step in translated.steps] == self.expected
+        assert [step.name for step in plain.steps] == [
+            name for name in self.expected if name != "translate"
+        ]
+
+    def test_declares_compatibility_phase_and_safety_inventory(self):
+        by_name = {
+            step.name: step for step in p.build_preprocessing_plan(False).steps
+        }
+        compatibility = {
+            "simplify_documentclass", "strip_problematic_packages",
+            "strip_noise_commands", "strip_annotation_system",
+            "normalize_textsc", "convert_pdf_resources",
+            "rewrite_pdf_image_refs", "normalize_citations",
+            "preprocess_hyperref", "normalize_table_envs",
+            "unwrap_makecell", "rewrite_captionof",
+            "strip_minipage_in_tables", "strip_at_col_specs",
+            "normalize_siunitx_columns", "strip_resizebox",
+            "strip_adjustbox", "convert_wrapfigure", "unwrap_subfigures",
+            "destar_floats", "replace_ding_commands",
+            "replace_textcircled", "preprocess_theorems",
+            "normalize_code_listings", "preprocess_algorithms",
+            "unnumber_paragraph_headings", "normalize_input_extensions",
+        }
+        assert by_name["discover"].phase is p.Phase.DISCOVERY
+        assert all(
+            by_name[name].phase is p.Phase.COMPATIBILITY
+            for name in compatibility
+        )
+        lossy = {
+            "simplify_documentclass", "strip_problematic_packages",
+            "strip_noise_commands", "strip_annotation_system",
+            "preprocess_hyperref", "normalize_table_envs",
+            "unwrap_makecell", "rewrite_captionof",
+            "strip_minipage_in_tables", "strip_resizebox",
+            "strip_adjustbox", "convert_wrapfigure", "unwrap_subfigures",
+            "destar_floats", "preprocess_theorems",
+            "normalize_code_listings", "preprocess_algorithms",
+            "unnumber_paragraph_headings",
+        }
+        assert all(by_name[name].safety is p.Safety.LOSSY for name in lossy)
+        assert by_name["normalize_citations"].safety is p.Safety.SAFE
+        assert by_name["rewrite_pdf_image_refs"].safety is p.Safety.SAFE
+
+    def test_invalid_dependency_fails_before_any_step_runs(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text("body")
+        called = []
+        step = p.PreprocessingStep(
+            "bad", lambda state: called.append("bad") or state,
+            after=frozenset({"missing"}),
+        )
+
+        with pytest.raises(p.PassDependencyError, match="missing"):
+            p.run_preprocessing(tmp_path, main, p.PreprocessingPlan((step,)))
+        assert called == []
+
+    def test_cycle_fails_before_any_step_runs(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text("body")
+        called = []
+        plan = p.PreprocessingPlan((
+            p.PreprocessingStep(
+                "a", lambda state: called.append("a") or state,
+                after=frozenset({"b"}),
+            ),
+            p.PreprocessingStep(
+                "b", lambda state: called.append("b") or state,
+                after=frozenset({"a"}),
+            ),
+        ))
+
+        with pytest.raises(p.PassDependencyError, match="cycle"):
+            p.run_preprocessing(tmp_path, main, plan)
+        assert called == []
+
+    def test_failure_writes_no_tex_files(self, tmp_path, monkeypatch):
+        main = tmp_path / "main.tex"
+        main.write_text("body")
+        writes = []
+        monkeypatch.setattr(p, "_write_source_content", lambda *args: writes.append(args))
+
+        def fail(state):
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            p.run_preprocessing(
+                tmp_path, main,
+                p.PreprocessingPlan((p.PreprocessingStep("fail", fail),)),
+            )
+        assert writes == []
+        assert main.read_text() == "body"
+
+    @pytest.mark.parametrize("failure", ["resource", "translation"])
+    def test_barrier_failure_rolls_back_earlier_tex_edits(
+        self, tmp_path, monkeypatch, failure,
+    ):
+        main = tmp_path / "main.tex"
+        original = (
+            r"\documentclass[12pt]{IEEEtran}"
+            r"\begin{document}Body.\end{document}"
+        )
+        main.write_text(original)
+        writes = []
+        monkeypatch.setattr(p, "_write_source_content", lambda *args: writes.append(args))
+
+        def fail_resource(root):
+            raise RuntimeError("resource failed")
+
+        def fail_translation(source, facts):
+            raise RuntimeError("translation failed")
+
+        plan = p.build_preprocessing_plan(
+            True,
+            resource_converter=(
+                fail_resource if failure == "resource"
+                else lambda root: p.ResourceResult(frozenset(), ())
+            ),
+            translator=(
+                fail_translation if failure == "translation"
+                else lambda source, facts: source.content
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match=failure):
+            p.run_preprocessing(tmp_path, main, plan)
+        assert writes == []
+        assert main.read_text() == original
+
+    def test_success_writes_changed_file_once_and_preserves_crlf(
+        self, tmp_path, monkeypatch,
+    ):
+        main = tmp_path / "main.tex"
+        child = tmp_path / "child.tex"
+        main.write_bytes(b"one\r\ntwo\r\n")
+        child.write_bytes(b"same\r\n")
+        writes = []
+        original = p._write_source_content
+
+        def record(path, content):
+            writes.append(path)
+            original(path, content)
+
+        monkeypatch.setattr(p, "_write_source_content", record)
+
+        def change(state):
+            sources = dict(state.snapshot.sources)
+            source = sources[main]
+            sources[main] = p.SourceFile(main, source.content.replace("one", "ONE"))
+            return replace(
+                state,
+                snapshot=replace(
+                    state.snapshot,
+                    sources=p.read_only_mapping(sources),
+                ),
+            )
+
+        p.run_preprocessing(
+            tmp_path, main,
+            p.PreprocessingPlan((p.PreprocessingStep("change", change),)),
+        )
+
+        assert writes == [main]
+        assert main.read_bytes() == b"ONE\r\ntwo\r\n"
+        assert child.read_bytes() == b"same\r\n"
+
+    def test_diagnostics_are_sorted_and_printed_once(self, tmp_path, capsys):
+        main = tmp_path / "main.tex"
+        main.write_text("body")
+
+        def diagnose(state):
+            diagnostics = (
+                p.Diagnostic(main, "z", "2", "last", 5, 6),
+                p.Diagnostic(main, "a", "1", "first", 1, 2),
+            )
+            return replace(state, diagnostics=diagnostics)
+
+        result = p.run_preprocessing(
+            tmp_path, main,
+            p.PreprocessingPlan((p.PreprocessingStep("diagnose", diagnose),)),
+        )
+
+        assert [item.message for item in result.diagnostics] == ["first", "last"]
+        stderr = capsys.readouterr().err
+        assert stderr.count("first") == 1
+        assert stderr.count("last") == 1
+
+    def test_multifile_complete_plan_is_idempotent(self, tmp_path, monkeypatch):
+        main = tmp_path / "main.tex"
+        sections = tmp_path / "sections"
+        sections.mkdir()
+        child = sections / "child.tex"
+        theorem = sections / "theorem.tex"
+        figure = tmp_path / "figure.pdf"
+        figure.write_bytes(b"fake pdf")
+        main.write_text(
+            r"\documentclass[12pt]{IEEEtran}" "\n"
+            r"\usepackage{hyperref}" "\n"
+            r"\title{Pipeline Paper}" "\n"
+            r"\author{Ada Author}" "\n"
+            r"\newtheorem{theorem}{Theorem}" "\n"
+            r"\begin{document}" "\n"
+            r"\maketitle" "\n"
+            r"\includegraphics{figure.pdf}" "\n"
+            r"\input{sections/child}" "\n"
+            r"\begin{minted}{python}print(1)\end{minted}" "\n"
+            r"\begin{algorithm}\caption{Work}\label{alg:work}"
+            r"\begin{algorithmic}\State{Go}\end{algorithmic}\end{algorithm}" "\n"
+            r"\end{document}" "\n"
+        )
+        child.write_text(
+            r"\begin{table*}\begin{tabular}{@{}lc@{}}"
+            r"\makecell{A\\B} & C\end{tabular}\end{table*}" "\n"
+            r"\input{theorem}"
+        )
+        theorem.write_text(
+            r"\begin{theorem}\label{thm:x}True.\end{theorem}" "\n"
+            r"\paragraph{Note} Text \ding{51}."
+        )
+        resources = lambda root: p.ResourceResult(frozenset({figure}), ())
+        plan = p.build_preprocessing_plan(
+            True,
+            resource_converter=resources,
+            translator=lambda source, facts: source.content,
+        )
+
+        first = p.run_preprocessing(tmp_path, main, plan)
+        writes = []
+        monkeypatch.setattr(
+            p, "_write_source_content", lambda path, content: writes.append(path),
+        )
+        second = p.run_preprocessing(tmp_path, main, plan)
+
+        assert first.discovery.title == "Pipeline Paper"
+        assert first.discovery.authors == ("Ada Author",)
+        assert first.snapshot.sources[main].content == second.snapshot.sources[main].content
+        assert first.snapshot.sources[child].content == second.snapshot.sources[child].content
+        assert first.snapshot.sources[theorem].content == second.snapshot.sources[theorem].content
+        assert writes == []
+        assert r"\includegraphics{figure.png}" in main.read_text()
+        assert r"\input{sections/child.tex}" in main.read_text()
+        assert r"\input{theorem.tex}" in child.read_text()
+        assert "minted" not in main.read_text()
+        assert "algorithmdisplay" in main.read_text()
+        assert r"\begin{quote}" in theorem.read_text()
+        assert main.read_text().count(r"\begin{document}") == 1
+        assert main.read_text().count(r"\end{document}") == 1
+
+    def test_real_translation_plan_is_idempotent_after_later_rewrites(
+        self, tmp_path, monkeypatch
+    ):
+        main = tmp_path / "main.tex"
+        child = tmp_path / "child.tex"
+        main.write_text(
+            r"\documentclass{article}\begin{document}"
+            r"\paragraph{Contributions.}" "\n"
+            "Body prose has enough English words for paragraph translation.\n"
+            r"\input{child}"
+            r"\end{document}"
+        )
+        child.write_text("Short child text.")
+        calls = []
+        monkeypatch.setattr(p, "extract_glossary", lambda *args: "")
+        monkeypatch.setattr(
+            p, "_build_heading_translations",
+            lambda client, glossary, headings: {"Contributions.": "贡献。"},
+        )
+        monkeypatch.setattr(
+            p, "_batch_translate",
+            lambda client, glossary, numbered: (
+                calls.append(dict(numbered))
+                or {index: "Chinese body." for index in numbered}
+            ),
+        )
+        plan = p.build_preprocessing_plan(
+            True,
+            translation_client=object(),
+            resource_converter=lambda root: p.ResourceResult(frozenset(), ()),
+        )
+
+        first = p.run_preprocessing(tmp_path, main, plan)
+        first_call_count = len(calls)
+        writes = []
+        monkeypatch.setattr(
+            p, "_write_source_content", lambda path, content: writes.append(path),
+        )
+        second = p.run_preprocessing(tmp_path, main, plan)
+
+        assert first_call_count == 1
+        assert len(calls) == first_call_count
+        assert second.snapshot.sources[main].content == first.snapshot.sources[main].content
+        assert writes == []
+        assert r"\paragraph*{Contributions.}" in main.read_text()
+        assert r"\input{child.tex}" in main.read_text()
+        assert main.read_text().count("% paper2epub:translation-begin:") == 1
+
+    def test_translation_preparation_uses_current_snapshot_sources(
+        self, tmp_path, monkeypatch,
+    ):
+        main = tmp_path / "main.tex"
+        original = (
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\section{About \textsc{Method}}"
+            r"Body prose with enough words for translation."
+            r"\end{document}"
+        )
+        main.write_text(original)
+        current_heading = r"About \text{Method}"
+
+        def fake_glossary(client, title, abstract, headings):
+            assert headings == [current_heading]
+            assert main.read_text() == original
+            return "Method | 方法"
+
+        def fake_heading_map(client, glossary, headings):
+            assert headings == [current_heading]
+            assert main.read_text() == original
+            return {current_heading: "关于方法"}
+
+        def fake_translate(client, glossary, heading_map, content):
+            assert current_heading in content
+            assert heading_map == {current_heading: "关于方法"}
+            assert main.read_text() == original
+            return p._translate_headings(heading_map, content)
+
+        monkeypatch.setattr(p, "extract_glossary", fake_glossary)
+        monkeypatch.setattr(p, "_build_heading_translations", fake_heading_map)
+        monkeypatch.setattr(p, "translate_file_content", fake_translate)
+        p.run_preprocessing(
+            tmp_path,
+            main,
+            p.build_preprocessing_plan(
+                True,
+                translation_client=object(),
+                resource_converter=lambda root: p.ResourceResult(frozenset(), ()),
+            ),
+        )
+
+        assert current_heading in main.read_text()
+        assert "关于方法" in main.read_text()
+
+
+class TestFinalPreprocessingArchitecture:
+    def test_legacy_structural_matchers_are_removed(self):
+        source = Path(p.__file__).read_text()
+
+        for name in (
+            "_CITE_RE",
+            "_STRIP_ENV_RE",
+            "_TABLE_STRIP_WIDTH_RES",
+            "_MINIPAGE_BEGIN_RE",
+            "_WRAPFIG_RE",
+            "_SUBFIG_BEGIN_RE",
+            "_ADJUSTBOX_ENV_BEGIN_RE",
+            "_NEWTHEOREM_RE",
+            "make_legacy_text_pass",
+            "_transform_tex_files",
+        ):
+            assert name not in source
+
+    def test_migrated_file_wrappers_are_removed(self):
+        source = Path(p.__file__).read_text()
+
+        for definition in (
+            "def simplify_documentclass(",
+            "def strip_problematic_packages(",
+            "def normalize_citations(",
+            "def preprocess_hyperref(",
+            "def normalize_table_envs(",
+            "def preprocess_theorems(",
+            "def normalize_code_listings(",
+            "def preprocess_algorithms(",
+            "def normalize_input_extensions(",
+        ):
+            assert definition not in source
+
+    def test_only_transaction_boundary_writes_tex_sources(self):
+        source = Path(p.__file__).read_text()
+
+        assert ".write_text(" not in source
+        assert source.count("_write_source_content(") == 2
 
 
 class TestEditPlanner:
@@ -204,6 +1420,36 @@ class TestEditPlanner:
         with pytest.raises(p.EditConflictError, match="overlap"):
             p.EditPlanner.apply(source, edits)
 
+    def test_containment_filter_keeps_crossing_edits_for_validation(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "abcdef")
+        outcome = p.PlanOutcome(edits=(
+            p.Edit(source.path, 0, 4, "", "outer", p.Safety.LOSSY),
+            p.Edit(source.path, 2, 6, "", "crossing", p.Safety.LOSSY),
+        ))
+
+        filtered = p._suppress_contained_edits(outcome)
+
+        with pytest.raises(p.EditConflictError, match="overlap"):
+            p.EditPlanner.apply(source, filtered.edits)
+
+    def test_containment_filter_preserves_diagnostics(self, tmp_path):
+        path = tmp_path / "main.tex"
+        diagnostic = p.Diagnostic(
+            path, "cleanup", "opaque-structure", "preserved", 2, 3,
+        )
+        outcome = p.PlanOutcome(
+            edits=(
+                p.Edit(path, 0, 5, "", "outer", p.Safety.LOSSY),
+                p.Edit(path, 2, 3, "", "inner", p.Safety.LOSSY),
+            ),
+            diagnostics=(diagnostic,),
+        )
+
+        filtered = p._suppress_contained_edits(outcome)
+
+        assert len(filtered.edits) == 1
+        assert filtered.diagnostics == (diagnostic,)
+
     @pytest.mark.parametrize("start,end", [(-1, 1), (3, 2), (0, 99)])
     def test_rejects_invalid_ranges(self, tmp_path, start, end):
         source = p.SourceFile(tmp_path / "main.tex", "abc")
@@ -222,6 +1468,259 @@ class TestEditPlanner:
 
         with pytest.raises(ValueError, match="different source file"):
             p.EditPlanner.apply(source, [edit])
+
+
+class TestStructuralPlannerPrimitives:
+    def test_unwrap_command_keeps_nested_argument(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex", r"A \resizebox{1cm}{!}{x \textbf{y}} Z"
+        )
+        document = p.LatexDocument(source)
+        outcome = p.plan_unwrap_command(
+            source, document.commands("resizebox")[0], 2,
+            "resizebox", p.Safety.LOSSY,
+        )
+
+        assert p.EditPlanner.apply(source, outcome.edits) == r"A x \textbf{y} Z"
+
+    def test_incomplete_command_is_skipped_with_diagnostic(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", r"\resizebox{1cm}{!}{x")
+        document = p.LatexDocument(source)
+        outcome = p.plan_unwrap_command(
+            source, document.commands("resizebox")[0], 2,
+            "resizebox", p.Safety.LOSSY,
+        )
+
+        assert outcome.edits == ()
+        assert outcome.diagnostics[0].code == "opaque-structure"
+
+    def test_remove_comment_environment_emits_exact_edit(self, tmp_path):
+        content = r"left\begin{comment}hidden \textbf{text}\end{comment}right"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        ref = p.LatexDocument(source).environments("comment")[0]
+
+        outcome = p.plan_remove_node(
+            source, ref, "remove_comment", p.Safety.LOSSY,
+        )
+
+        assert outcome.edits == (p.Edit(
+            source.path,
+            content.index(r"\begin{comment}"),
+            content.index(r"\end{comment}") + len(r"\end{comment}"),
+            "",
+            "remove_comment",
+            p.Safety.LOSSY,
+        ),)
+        assert p.EditPlanner.apply(source, outcome.edits) == "leftright"
+
+    def test_unwrap_hyperlink_preserves_nested_label_and_adjacent_text(
+        self, tmp_path,
+    ):
+        content = r"L\hyperlink{target}{click \textbf{here}}R"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        ref = p.LatexDocument(source).commands("hyperlink")[0]
+
+        outcome = p.plan_unwrap_command(
+            source, ref, 1, "unwrap_hyperlink", p.Safety.LOSSY,
+        )
+
+        assert outcome.edits == (p.Edit(
+            source.path,
+            1,
+            len(content) - 1,
+            r"click \textbf{here}",
+            "unwrap_hyperlink",
+            p.Safety.LOSSY,
+        ),)
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"Lclick \textbf{here}R"
+        )
+
+    def test_rename_tabular_environment_changes_only_name_tokens(self, tmp_path):
+        content = r"A\begin{tabular}{lc}x&y\end{tabular}Z"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        ref = p.LatexDocument(source).environments("tabular")[0]
+
+        outcome = p.plan_rename_environment(
+            source, ref, "tabularx", "rename_table", p.Safety.SAFE,
+        )
+
+        assert outcome.edits == (
+            p.Edit(source.path, 8, 15, "tabularx", "rename_table", p.Safety.SAFE),
+            p.Edit(
+                source.path, len(content) - 9, len(content) - 2,
+                "tabularx", "rename_table", p.Safety.SAFE,
+            ),
+        )
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"A\begin{tabularx}{lc}x&y\end{tabularx}Z"
+        )
+
+    def test_unwrap_adjustbox_removes_only_boundary_ranges(self, tmp_path):
+        content = (
+            r"before\begin{adjustbox}{width=1cm}"
+            r"x \textbf{y}\end{adjustbox}after"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        ref = p.LatexDocument(source).environments("adjustbox")[0]
+
+        outcome = p.plan_unwrap_environment(
+            source, ref, "unwrap_adjustbox", p.Safety.LOSSY,
+        )
+
+        assert outcome.edits == (
+            p.Edit(
+                source.path, ref.start, ref.body_start, "",
+                "unwrap_adjustbox", p.Safety.LOSSY,
+            ),
+            p.Edit(
+                source.path, ref.body_end, ref.end, "",
+                "unwrap_adjustbox", p.Safety.LOSSY,
+            ),
+        )
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"beforex \textbf{y}after"
+        )
+
+    def test_transform_tabular_argument_replaces_only_delimited_text(
+        self, tmp_path,
+    ):
+        content = r"A\begin{tabular}{>{\bfseries}lc}x&y\end{tabular}Z"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        ref = p.LatexDocument(source).environments("tabular")[0]
+        argument = ref.arguments[0]
+        assert argument is not None
+
+        outcome = p.plan_transform_argument(
+            source, ref, 0, lambda text: text.replace("l", "X"),
+            "columns", p.Safety.SAFE,
+        )
+
+        assert outcome.edits == (p.Edit(
+            source.path,
+            argument.start + 1,
+            argument.end - 1,
+            r">{\bfseries}Xc",
+            "columns",
+            p.Safety.SAFE,
+        ),)
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"A\begin{tabular}{>{\bfseries}Xc}x&y\end{tabular}Z"
+        )
+
+    def test_non_idempotent_argument_transform_is_skipped(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex", r"\begin{tabular}{lc}x&y\end{tabular}",
+        )
+        ref = p.LatexDocument(source).environments("tabular")[0]
+
+        outcome = p.plan_transform_argument(
+            source, ref, 0, lambda text: text + "x",
+            "columns", p.Safety.SAFE,
+        )
+
+        assert outcome.edits == ()
+        assert outcome.diagnostics[0].code == "non-idempotent-transform"
+
+    def test_foreign_references_are_rejected_by_all_primitives(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "local")
+        foreign = p.SourceFile(
+            tmp_path / "foreign.tex",
+            r"\hyperlink{target}{label}\begin{tabular}{lc}x&y\end{tabular}",
+        )
+        document = p.LatexDocument(foreign)
+        command = document.commands("hyperlink")[0]
+        environment = document.environments("tabular")[0]
+
+        outcomes = (
+            p.plan_remove_node(source, command, "remove", p.Safety.LOSSY),
+            p.plan_unwrap_command(
+                source, command, 1, "unwrap_command", p.Safety.LOSSY,
+            ),
+            p.plan_rename_environment(
+                source, environment, "tabularx", "rename", p.Safety.SAFE,
+            ),
+            p.plan_unwrap_environment(
+                source, environment, "unwrap_environment", p.Safety.LOSSY,
+            ),
+            p.plan_transform_argument(
+                source, environment, 0, str.upper,
+                "transform", p.Safety.SAFE,
+            ),
+        )
+
+        assert all(outcome.edits == () for outcome in outcomes)
+        assert all(
+            outcome.diagnostics[0].code == "foreign-reference"
+            for outcome in outcomes
+        )
+
+    def test_spaced_comment_environment_rename_preserves_opaque_form(
+        self, tmp_path,
+    ):
+        content = r"A\begin {comment}hidden\end {comment}Z"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        ref = p.LatexDocument(source).environments("comment")[0]
+        assert ref.opaque
+
+        outcome = p.plan_rename_environment(
+            source, ref, "discard", "rename_comment", p.Safety.SAFE,
+        )
+
+        assert outcome.edits == ()
+        assert outcome.diagnostics[0].code == "opaque-structure"
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+
+    def test_incomplete_environment_is_preserved_by_all_environment_planners(
+        self, tmp_path,
+    ):
+        source = p.SourceFile(
+            tmp_path / "main.tex", r"\begin{adjustbox}{width=1cm}body",
+        )
+        ref = p.LatexDocument(source).environments("adjustbox")[0]
+
+        outcomes = (
+            p.plan_remove_node(source, ref, "remove", p.Safety.LOSSY),
+            p.plan_rename_environment(
+                source, ref, "center", "rename", p.Safety.LOSSY,
+            ),
+            p.plan_unwrap_environment(
+                source, ref, "unwrap", p.Safety.LOSSY,
+            ),
+            p.plan_transform_argument(
+                source, ref, 0, str.upper, "transform", p.Safety.LOSSY,
+            ),
+        )
+
+        assert all(outcome.edits == () for outcome in outcomes)
+        assert all(
+            outcome.diagnostics[0].code == "opaque-structure"
+            for outcome in outcomes
+        )
+
+    def test_replanning_transformed_output_emits_no_edits(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex", r"A\hyperlink{target}{label}Z",
+        )
+
+        def plan(current):
+            document = p.LatexDocument(current)
+            outcomes = [
+                p.plan_unwrap_command(
+                    current, ref, 1, "unwrap_hyperlink", p.Safety.LOSSY,
+                )
+                for ref in document.commands("hyperlink")
+            ]
+            return tuple(
+                edit for outcome in outcomes for edit in outcome.edits
+            )
+
+        first_edits = plan(source)
+        updated = p.EditPlanner.apply(source, first_edits)
+        reparsed = p.SourceFile(source.path, updated)
+
+        assert updated == "AlabelZ"
+        assert plan(reparsed) == ()
 
 
 class TestFindMatchingBrace:
@@ -282,47 +1781,6 @@ class TestExtractBraceArg:
 
 
 # ── _unwrap_latex_cmd ───────────────────────────────────────────────────────
-
-
-class TestUnwrapLatexCmd:
-    def test_adjustbox(self):
-        assert p._unwrap_latex_cmd(
-            r"\adjustbox{width=5cm}{content}", r"\adjustbox", 2
-        ) == "content"
-
-    def test_resizebox(self):
-        assert p._unwrap_latex_cmd(
-            r"\resizebox{1cm}{!}{hello}", r"\resizebox", 3, star=True
-        ) == "hello"
-
-    def test_resizebox_star(self):
-        assert p._unwrap_latex_cmd(
-            r"\resizebox*{1cm}{!}{hello}", r"\resizebox", 3, star=True
-        ) == "hello"
-
-    def test_texorpdfstring_keep_first(self):
-        assert p._unwrap_latex_cmd(
-            r"\texorpdfstring{$\alpha$}{alpha}", r"\texorpdfstring", 2, keep=0
-        ) == "$\\alpha$"
-
-    def test_no_match_passes_through(self):
-        text = "no commands here"
-        assert p._unwrap_latex_cmd(text, r"\foo", 1) == text
-
-    def test_partial_name_not_matched(self):
-        text = r"\adjustboxes are cool"
-        assert p._unwrap_latex_cmd(text, r"\adjustbox", 2) == text
-
-    def test_multiple_occurrences(self):
-        text = r"\adjustbox{a}{X} and \adjustbox{b}{Y}"
-        assert p._unwrap_latex_cmd(text, r"\adjustbox", 2) == "X and Y"
-
-    def test_surrounding_text_preserved(self):
-        text = r"before \resizebox{w}{h}{inner} after"
-        assert p._unwrap_latex_cmd(text, r"\resizebox", 3, star=True) == "before inner after"
-
-
-# ── _parse_numbered_response ────────────────────────────────────────────────
 
 
 class TestParseNumberedResponse:
@@ -419,446 +1877,936 @@ class TestBatchTranslate:
 # ── Title & Author extraction ──────────────────────────────────────────────
 
 
-class TestExtractTitle:
-    def test_simple_title(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\title{My Paper}")
-        assert p.extract_title(tex, {}) == "My Paper"
-
-    def test_title_with_short_title(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\title[short]{Full Title Here}")
-        assert p.extract_title(tex, {}) == "Full Title Here"
-
-    def test_title_with_macro(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\title{The \myabbr Method}")
-        assert p.extract_title(tex, {"myabbr": "COOL"}) == "The COOLMethod"
-
-    def test_no_title(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\begin{document} hello \end{document}")
-        assert p.extract_title(tex, {}) is None
-
-    def test_title_with_linebreak(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\title{Line One \\ Line Two}")
-        assert p.extract_title(tex, {}) == "Line One Line Two"
-
-    def test_title_via_content_param(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text("unused")
-        result = p.extract_title(tex, {}, _content=r"\title{Direct}")
-        assert result == "Direct"
-
-    def test_title_with_nested_braces(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\title{Learning $\mathcal{F}$ Spaces}")
-        # extract_title strips \cmd{arg} → arg, so \mathcal{F} → F
-        assert p.extract_title(tex, {}) == "Learning $F$ Spaces"
-
-    def test_comment_stripped(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text("% \\title{Commented}\n\\title{Actual}")
-        assert p.extract_title(tex, {}) == "Actual"
-
-
-class TestExtractAuthors:
-    def test_single_author(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\author{John Smith}")
-        assert p.extract_authors(tex, {}) == ["John Smith"]
-
-    def test_multiple_authors(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\author{Alice, Bob, Charlie}")
-        assert p.extract_authors(tex, {}) == ["Alice", "Bob", "Charlie"]
-
-    def test_no_author(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\begin{document}")
-        assert p.extract_authors(tex, {}) == []
-
-    def test_affiliations_stripped(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\author{Alice, Bob \\ University}")
-        assert p.extract_authors(tex, {}) == ["Alice", "Bob"]
-
-
-# ── Macro handling ──────────────────────────────────────────────────────────
-
-
 class TestExpandMacros:
-    def test_simple(self):
-        assert p.expand_macros(r"\foo bar", {"foo": "FOO"}) == "FOObar"
-
-    def test_recursive(self):
-        macros = {"a": r"\b", "b": "DONE"}
-        assert p.expand_macros(r"\a", macros) == "DONE"
-
-    def test_no_match(self):
-        assert p.expand_macros("no macros", {"x": "y"}) == "no macros"
-
-    def test_depth_limit(self):
-        macros = {"a": r"\a"}  # infinite recursion
-        result = p.expand_macros(r"\a", macros, depth=3)
-        assert r"\a" in result  # stops after depth
-
-
-class TestCollectMacros:
-    def test_newcommand(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text(r"\newcommand{\foo}{bar}")
-        macros = p.collect_macros(tmp_path)
-        assert macros["foo"] == "bar"
-
-    def test_renewcommand(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text(r"\renewcommand{\baz}{qux}")
-        macros = p.collect_macros(tmp_path)
-        assert macros["baz"] == "qux"
-
-    def test_declare_math_operator(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text(r"\DeclareMathOperator{\argmax}{arg\,max}")
-        macros = p.collect_macros(tmp_path)
-        assert macros["argmax"] == r"\operatorname{arg\,max}"
-
-    def test_xspace_stripped(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text(r"\newcommand{\myname}{Cool\xspace}")
-        macros = p.collect_macros(tmp_path)
-        assert macros["myname"] == "Cool"
-
-
-# ── TeX content transforms ─────────────────────────────────────────────────
-
-
-class TestStripProblematicPackages:
-    def test_strips_single_package(self):
-        content = r"\usepackage{hyperref}"
-        assert p._strip_problematic_packages_content(content).strip() == ""
-
-    def test_keeps_unknown_package(self):
-        content = r"\usepackage{amsmath}"
-        assert "amsmath" in p._strip_problematic_packages_content(content)
-
-    def test_splits_multi_package(self):
-        content = r"\usepackage{amsmath, hyperref}"
-        result = p._strip_problematic_packages_content(content)
-        assert "amsmath" in result
-        assert "hyperref" not in result
-
-    def test_strips_config_command(self):
-        content = r"\hypersetup{colorlinks=true}"
-        result = p._strip_problematic_packages_content(content)
-        assert "hypersetup" not in result
-
-    def test_strips_makeatletter(self):
-        content = "\\makeatletter\nsome code\n\\makeatother"
-        result = p._strip_problematic_packages_content(content)
-        assert "makeatletter" not in result
-        assert "makeatother" not in result
-
-
-class TestStripAtCommands:
-    def test_strips_complete_internal_definition(self):
-        content = r"before\newcommand{\pkg@internal}{value}after"
-        assert p._strip_at_commands(content) == "beforeafter"
-
-    def test_strips_definition_with_nested_replacement(self):
-        content = r"\renewcommand{\pkg@internal}[1]{outer{inner{#1}}}tail"
-        assert p._strip_at_commands(content) == "tail"
-
-    def test_preserves_incomplete_definition(self):
-        content = r"\providecommand{\pkg@internal}{unfinished"
-        assert p._strip_at_commands(content) == content
-
-    def test_leaves_non_definition_text_unchanged(self):
-        content = r"Text mentioning \pkg@internal without a definition."
-        assert p._strip_at_commands(content) == content
-
-    def test_is_idempotent(self):
-        content = r"A\DeclareRobustCommand{\pkg@internal}{x}B"
-        once = p._strip_at_commands(content)
-        assert p._strip_at_commands(once) == once
-
-
-class TestStripNoiseContent:
-    def test_strips_noindent(self):
-        assert "noindent" not in p._strip_noise_content(r"\noindent Hello")
-
-    def test_strips_vspace(self):
-        result = p._strip_noise_content(r"\vspace{1cm} text")
-        assert "vspace" not in result
-        assert "text" in result
-
-    def test_strips_vspace_star(self):
-        result = p._strip_noise_content(r"\vspace*{1cm} text")
-        assert "vspace" not in result
-        assert "text" in result
-
-    def test_strips_setlength(self):
-        result = p._strip_noise_content(r"\setlength{\parindent}{0pt} text")
-        assert "setlength" not in result
-        assert "text" in result
-
-    def test_strips_tikzpicture(self):
-        content = r"before \begin{tikzpicture}\draw (0,0) -- (1,1);\end{tikzpicture} after"
-        result = p._strip_noise_content(content)
-        assert "tikzpicture" not in result
-        assert "before" in result
-        assert "after" in result
-
-    def test_keeps_normal_text(self):
-        text = "Just normal text"
-        assert p._strip_noise_content(text) == text
-
-    def test_strips_notag(self):
-        result = p._strip_noise_content(r"x + y \notag\\")
-        assert "notag" not in result
-        assert r"x + y \\" in result
-
-    def test_strips_stepcounter(self):
-        result = p._strip_noise_content(r"\stepcounter{equation} text")
-        assert "stepcounter" not in result
-        assert "text" in result
-
-    def test_strips_csgdef(self):
-        result = p._strip_noise_content(r"\csgdef{mykey}{myval} text")
-        assert "csgdef" not in result
-        assert "text" in result
-
-    def test_strips_ccsxml_env(self):
-        content = (
-            "before\n"
-            "\\begin{CCSXML}\n<ccs2012>\n<concept>\n"
-            "<concept_id>10010147</concept_id>\n"
-            "</concept>\n</ccs2012>\n\\end{CCSXML}\n"
-            "after"
+    def test_required_and_multiple_arguments(self):
+        macros = {
+            "one": p.MacroDefinition("<#1>", 1),
+            "two": p.MacroDefinition("#2/#1", 2),
+        }
+        assert p.expand_macros(r"\one{A} \two{left}{right}", macros) == (
+            "<A> right/left"
         )
-        result = p._strip_noise_content(content)
-        assert "ccs2012" not in result
-        assert "CCSXML" not in result
-        assert "before" in result
-        assert "after" in result
 
-    def test_strips_ccsdesc(self):
-        content = r"\ccsdesc[500]{Computing methodologies~Machine learning}" + "\ntext"
-        result = p._strip_noise_content(content)
-        assert "ccsdesc" not in result
-        assert "text" in result
+    def test_optional_argument_uses_value_or_default(self):
+        macros = {
+            "named": p.MacroDefinition("#1/#2", 2, "Default"),
+        }
+        assert p.expand_macros(r"\named{X}", macros) == "Default/X"
+        assert p.expand_macros(r"\named[Given]{X}", macros) == "Given/X"
 
-    def test_strips_ccsdesc_no_optional(self):
-        content = r"\ccsdesc{Some description}" + "\ntext"
-        result = p._strip_noise_content(content)
-        assert "ccsdesc" not in result
-        assert "text" in result
+    def test_nested_expansion(self):
+        macros = {
+            "outer": p.MacroDefinition(r"\inner{#1}", 1),
+            "inner": p.MacroDefinition("[#1]", 1),
+        }
+        assert p.expand_macros(r"\outer{value}", macros) == "[value]"
+
+    def test_nested_known_candidates_expand_without_overlapping_edits(self):
+        macros = {
+            "outer": p.MacroDefinition("<#1>", 1),
+            "inner": p.MacroDefinition("[#1]", 1),
+        }
+        assert p.expand_macros(r"\outer{\inner{x}}", macros) == "<[x]>"
+
+    def test_missing_or_malformed_arguments_are_preserved(self):
+        macros = {"pair": p.MacroDefinition("#1/#2", 2)}
+        assert p.expand_macros(r"\pair{only}", macros) == r"\pair{only}"
+        assert p.expand_macros(r"\pair{one}{broken", macros) == (
+            r"\pair{one}{broken"
+        )
+
+    def test_out_of_range_parameter_reference_preserves_invocation(self):
+        macros = {"invalid": p.MacroDefinition("#2", 1)}
+        assert p.expand_macros(r"\invalid{value}", macros) == (
+            r"\invalid{value}"
+        )
+
+    def test_expands_trenv_parameterized_title_wrappers(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\documentclass{article}"
+            r"\title{\update{\systemname: Transparently Share Serverless "
+            r"Execution Environments Across Different Functions and Nodes}}"
+            r"\newcommand{\systemname}{\textsc{TrEnv-X}\xspace}"
+            r"\newcommand{\update}[1]{#1}"
+            r"\begin{document}\end{document}"
+        )
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        assert snapshot.discovery.title == (
+            "TrEnv-X: Transparently Share Serverless Execution Environments "
+            "Across Different Functions and Nodes"
+        )
+        assert "#1" not in snapshot.discovery.title
+
+    def test_zero_argument_math_operator_and_literal_hash(self):
+        macros = {
+            "name": p.MacroDefinition("TrEnv-X"),
+            "op": p.MacroDefinition("argmin", math_operator=True),
+            "hash": p.MacroDefinition("##1", 1),
+        }
+        assert p.expand_macros(r"\name \op \hash{x}", macros) == (
+            r"TrEnv-X\operatorname{argmin}#1"
+        )
+
+    def test_unknown_comment_prefix_and_self_recursion_are_conservative(self):
+        macros = {
+            "foo": p.MacroDefinition("FOO"),
+            "foobar": p.MacroDefinition("BAR"),
+            "loop": p.MacroDefinition(r"\loop"),
+        }
+        text = "% \\foo\n" + r"\unknown \foobar \loop"
+        assert p.expand_macros(text, macros) == "% \\foo\n" + (
+            r"\unknown BAR\loop"
+        )
+
+    def test_parameterized_author_macro_is_expanded_in_discovery(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\newcommand{\person}[2]{#1 #2}"
+            r"\author{\person{Ada}{Lovelace}}"
+            r"\begin{document}\end{document}"
+        )
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        assert snapshot.discovery.authors == ("Ada Lovelace",)
+
+    def test_acyclic_expansion_is_idempotent(self):
+        macros = {
+            "outer": p.MacroDefinition(r"\inner{#1}", 1),
+            "inner": p.MacroDefinition("[#1]", 1),
+        }
+        once = p.expand_macros(r"\outer{x}", macros)
+        assert p.expand_macros(once, macros) == once == "[x]"
+
+    def test_non_fixed_point_cycle_is_strictly_depth_limited(self):
+        macros = {
+            "a": p.MacroDefinition(r"\b"),
+            "b": p.MacroDefinition(r"\a"),
+        }
+        assert p.expand_macros(r"\a", macros, depth=1) == r"\b"
+        assert p.expand_macros(r"\a", macros, depth=2) == r"\a"
+
+
+class TestPreambleCleanupPlanners:
+    def test_filters_only_the_package_list_argument(self, tmp_path):
+        content = r"Lead \usepackage[final]{amsmath, hyperref} tail"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_filter_packages(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"Lead \usepackage[final]{amsmath} tail"
+        )
+
+    def test_complete_config_and_internal_definition_are_removed(self, tmp_path):
+        content = (
+            r"A\hypersetup{colorlinks={true}}"
+            r"\newcommand{\pkg@internal}[1]{outer{#1}}Z"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_config(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == "AZ"
+
+    def test_incomplete_config_is_preserved_with_diagnostic(self, tmp_path):
+        content = r"Before \hypersetup{colorlinks=true After"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_config(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_internal_definition_suppresses_nested_package_edit(self, tmp_path):
+        content = r"A\newcommand{\pkg@internal}{\usepackage{hyperref}}Z"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p._plan_problematic_packages(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == "AZ"
+
+    def test_package_and_config_cleanup_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\usepackage{amsmath,hyperref}\hypersetup{x={y}}Body",
+        )
+        first = p.EditPlanner.apply(
+            source,
+            p._plan_problematic_packages(source, p.LatexDocument(source)).edits,
+        )
+        rewritten = p.SourceFile(source.path, first)
+        second = p._plan_problematic_packages(
+            rewritten, p.LatexDocument(rewritten),
+        )
+
+        assert p.EditPlanner.apply(rewritten, second.edits) == first
+
+    def test_config_cleanup_preserves_graphicspath(self, tmp_path):
+        content = (
+            r"\graphicspath{{figures/}}"
+            r"\hypersetup{colorlinks=true}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p._plan_problematic_packages(source, p.LatexDocument(source))
+
+        result = p.EditPlanner.apply(source, outcome.edits)
+        assert result == r"\graphicspath{{figures/}}"
+
+
+class TestStripNoisePlanner:
+    @pytest.mark.parametrize("content", [
+        r"A\noindent B",
+        r"A\notag B",
+        r"A\stepcounter{equation}B",
+        r"A\csgdef{key}{value}B",
+    ])
+    def test_removes_registered_complete_noise_commands(self, tmp_path, content):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == "AB"
+
+    def test_nested_ccsdesc_is_removed_as_one_complete_command(self, tmp_path):
+        content = r"Before \ccsdesc[500]{Computing~{Machine learning}} After"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == "Before  After"
+
+    def test_incomplete_two_argument_noise_command_is_preserved(self, tmp_path):
+        content = r"Before \setlength{\parindent} After"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_nested_comment_environment_is_removed_as_outermost_node(self, tmp_path):
+        content = (
+            r"A\begin{comment}outer \begin{comment}inner\end{comment} "
+            r"tail\end{comment}Z"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == "AZ"
+
+    def test_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"A\vspace*{1em}\begin{CCSXML}x\end{CCSXML}Z",
+        )
+        first = p.EditPlanner.apply(
+            source,
+            p.plan_strip_noise(source, p.LatexDocument(source)).edits,
+        )
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_strip_noise(rewritten, p.LatexDocument(rewritten))
+        assert p.EditPlanner.apply(rewritten, second.edits) == first
 
 
 class TestNormalizeCitations:
-    def test_citep(self):
-        result = p._CITE_RE.sub(r"\\cite{\1}", r"\citep{smith2020}")
+    @staticmethod
+    def apply(tmp_path, content):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_citations(source, p.LatexDocument(source))
+        return source, outcome, p.EditPlanner.apply(source, outcome.edits)
+
+    def test_citep(self, tmp_path):
+        _, _, result = self.apply(tmp_path, r"\citep{smith2020}")
         assert result == r"\cite{smith2020}"
 
-    def test_textcite(self):
-        result = p._CITE_RE.sub(r"\\cite{\1}", r"\textcite{jones2021}")
+    def test_textcite(self, tmp_path):
+        _, _, result = self.apply(tmp_path, r"\textcite{jones2021}")
         assert result == r"\cite{jones2021}"
 
-    def test_citep_with_options(self):
-        result = p._CITE_RE.sub(r"\\cite{\1}", r"\citep[see][p.~5]{ref}")
-        assert result == r"\cite{ref}"
+    def test_nested_citation_notes_are_consumed_as_arguments(self, tmp_path):
+        content = r"See \citep[see {Appendix A}][pp.~{2--3}]{alpha,beta}."
+        _, _, result = self.apply(tmp_path, content)
+        assert result == r"See \cite{alpha,beta}."
 
-    def test_existing_cite_unchanged(self):
+    def test_incomplete_citation_is_preserved_with_diagnostic(self, tmp_path):
+        content = r"See \citep[see]{alpha"
+        _, outcome, result = self.apply(tmp_path, content)
+        assert result == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_existing_cite_unchanged(self, tmp_path):
         original = r"\cite{ref}"
-        result = p._CITE_RE.sub(r"\\cite{\1}", original)
+        _, _, result = self.apply(tmp_path, original)
         assert result == original
 
-
-class TestStripAnnotationSystem:
-    def test_rewrites_atran_simple(self):
-        content = r"\newcommand{\atran}[2]{\overset{#2}{#1}}"
-        result = p._strip_annotation_system(content)
-        assert result == r"\newcommand{\atran}[2]{#1}"
-
-    def test_rewrites_atran_nested_braces(self):
-        content = r"\newcommand{\atran}[2]{\underset{#2}{\longrightarrow}}"
-        result = p._strip_annotation_system(content)
-        assert result == r"\newcommand{\atran}[2]{#1}"
-
-    def test_rewrites_atran_multiline(self):
-        content = (
-            "\\newcommand{\\atran}[2]{%\n"
-            "  \\stepcounter{cnt}%\n"
-            "  \\overset{\\text{(a)}}{#1}%\n"
-            "}"
+    def test_apply_reparse_replan_is_idempotent(self, tmp_path):
+        source, _, first = self.apply(
+            tmp_path, r"\citep[see {A}][p.~2]{alpha}",
         )
-        result = p._strip_annotation_system(content)
-        assert result == r"\newcommand{\atran}[2]{#1}"
-
-    def test_strips_annotate_counter(self):
-        content = r"\newcounter{annotatecount}" "\n" r"\newcounter{annotateidx}" "\ntext"
-        result = p._strip_annotation_system(content)
-        assert "newcounter" not in result
-        assert "text" in result
-
-    def test_strips_annotate_helper_defs(self):
-        content = r"\newcommand{\annotateinitused}{\setcounter{x}{0}}" "\ntext"
-        result = p._strip_annotation_system(content)
-        assert "annotateinitused" not in result
-        assert "text" in result
-
-    def test_preserves_surrounding_content(self):
-        content = "before\n\\newcommand{\\atran}[2]{#1}\nafter"
-        result = p._strip_annotation_system(content)
-        assert "before" in result
-        assert "after" in result
-
-    def test_no_atran_passthrough(self):
-        content = "no annotation here"
-        assert p._strip_annotation_system(content) == content
+        assert first == r"\cite{alpha}"
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_normalize_citations(
+            rewritten, p.LatexDocument(rewritten),
+        )
+        assert second.edits == ()
 
 
-class TestPreprocessHyperref:
+class TestReferencePlanners:
+    @pytest.mark.parametrize(
+        "command,args",
+        [*(
+            (name, "{key}") for name in p._CITE_ALIASES
+        ),
+        ("hyperref", "[target]{text}"),
+        ("hyperlink", "{target}{text}"),
+        ("hypertarget", "{target}{text}"),
+        ("Hy@raisedlink", "{text}"),
+        ("texorpdfstring", "{tex}{pdf}"),
+        ("ding", "{51}"),
+        ("textcircled", "{1}"),
+        ],
+    )
+    def test_parser_registers_reference_command_signatures(
+        self, tmp_path, command, args,
+    ):
+        source = p.SourceFile(tmp_path / "main.tex", f"\\{command}{args}")
+        refs = p.LatexDocument(source).commands(command)
+        assert len(refs) == 1
+        assert refs[0].complete
+
+    def test_link_commands_unwrap_nested_arguments(self, tmp_path):
+        content = (
+            r"\hyperref[sec:{one}]{See {Section One}} "
+            r"\hyperlink{target}{link {text}} "
+            r"\hypertarget{target}{anchor} "
+            r"\Hy@raisedlink{raised} "
+            r"\texorpdfstring{TeX {text}}{PDF text}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_preprocess_links(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            "See {Section One} link {text} anchor raised TeX {text}"
+        )
+
+    def test_incomplete_link_is_preserved_with_diagnostic(self, tmp_path):
+        content = r"before \hyperref[sec]{broken"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_preprocess_links(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_inline_symbols_replace_known_and_preserve_unknown(self, tmp_path):
+        content = r"\ding{51} \ding{999} $\textcircled{2}$ \textcircled{99}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_inline_symbols(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"✓ \ding{999} ② \textcircled{99}"
+        )
+
+    def test_incomplete_symbol_is_preserved_with_diagnostic(self, tmp_path):
+        content = r"\ding{51"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_inline_symbols(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_links_apply_reparse_replan_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\hyperref[sec]{See \texorpdfstring{TeX}{PDF}}",
+        )
+        first_outcome = p.plan_preprocess_links(source, p.LatexDocument(source))
+        first = p.EditPlanner.apply(source, first_outcome.edits)
+        assert first == "See TeX"
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_preprocess_links(rewritten, p.LatexDocument(rewritten))
+        assert second.edits == ()
+
+    def test_symbols_apply_reparse_replan_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex", r"\ding{51} $\textcircled{2}$",
+        )
+        first_outcome = p.plan_inline_symbols(source, p.LatexDocument(source))
+        first = p.EditPlanner.apply(source, first_outcome.edits)
+        assert first == "✓ ②"
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_inline_symbols(rewritten, p.LatexDocument(rewritten))
+        assert second.edits == ()
+
+
+class TestStripAnnotationPlanner:
+    def test_rewrites_atran_body_and_removes_helpers_structurally(self, tmp_path):
+        content = (
+            r"\newcommand{\atran}[2]{\overset{#2}{#1}}"
+            r"\newcommand{\annotateinitused}{\setcounter{x}{0}}"
+            r"\newcounter{annotatecount}Body"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_annotations(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"\newcommand{\atran}[2]{#1}Body"
+        )
+
+    def test_incomplete_atran_definition_is_preserved(self, tmp_path):
+        content = r"\newcommand{\atran}[2]{unfinished"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_annotations(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_helper_definition_suppresses_nested_counter_edit(self, tmp_path):
+        content = r"A\newcommand{\annotateinitused}{\newcounter{annotatecount}}Z"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_annotations(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == "AZ"
+
+    def test_atran_body_replacement_suppresses_nested_candidates(self, tmp_path):
+        content = (
+            r"\newcommand{\atran}[2]{"
+            r"\newcommand{\annotateinitused}{x}"
+            r"\newcounter{annotatecount}#1}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_annotations(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"\newcommand{\atran}[2]{#1}"
+        )
+
+    def test_annotation_cleanup_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\newcommand{\atran}[2]{x}\newcounter{annotatecount}Body",
+        )
+        first = p.EditPlanner.apply(
+            source,
+            p.plan_strip_annotations(source, p.LatexDocument(source)).edits,
+        )
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_strip_annotations(rewritten, p.LatexDocument(rewritten))
+
+        assert p.EditPlanner.apply(rewritten, second.edits) == first
+
+
+class TestPlanPreprocessLinks:
+    @staticmethod
+    def apply(content):
+        source = p.SourceFile(Path("<test>"), content)
+        outcome = p.plan_preprocess_links(source, p.LatexDocument(source))
+        return p.EditPlanner.apply(source, outcome.edits)
+
     def test_hyperref_unwrapped(self):
-        result = p._preprocess_hyperref_content(r"\hyperref[sec:intro]{Introduction}")
+        result = self.apply(r"\hyperref[sec:intro]{Introduction}")
         assert result == "Introduction"
 
     def test_hyperref_unwrapped_with_nested_visible_text(self):
-        result = p._preprocess_hyperref_content(r"\hyperref[sec:intro]{See \textbf{Introduction}}")
+        result = self.apply(r"\hyperref[sec:intro]{See \textbf{Introduction}}")
         assert result == r"See \textbf{Introduction}"
 
     def test_texorpdfstring(self):
-        result = p._preprocess_hyperref_content(r"\texorpdfstring{$\alpha$}{alpha}")
+        result = self.apply(r"\texorpdfstring{$\alpha$}{alpha}")
         assert result == "$\\alpha$"
 
     def test_combined(self):
         content = r"\hyperref[tab]{\texorpdfstring{$x$}{x} table}"
-        result = p._preprocess_hyperref_content(content)
+        result = self.apply(content)
         assert "$x$ table" == result
 
     def test_hy_raisedlink(self):
-        result = p._preprocess_hyperref_content(r"\Hy@raisedlink{\hypertarget{lbl}{}} text")
+        result = self.apply(r"\Hy@raisedlink{\hypertarget{lbl}{}} text")
         assert "Hy@raisedlink" not in result
 
     def test_hypertarget(self):
-        result = p._preprocess_hyperref_content(r"\hypertarget{label}{visible text}")
+        result = self.apply(r"\hypertarget{label}{visible text}")
         assert result == "visible text"
 
+    def test_preserves_generated_algorithm_anchor(self):
+        content = p.build_algorithm_output(
+            "Work", "alg:work", [(1, 0, "Go")], 1,
+        )
+
+        assert self.apply(content) == content
+
+    def test_unwraps_visible_hypertarget_inside_algorithm_display(self):
+        content = (
+            r"\begin{algorithmdisplay}"
+            r"\hypertarget{user}{Visible text}"
+            r"\end{algorithmdisplay}"
+        )
+
+        assert self.apply(content) == (
+            r"\begin{algorithmdisplay}Visible text\end{algorithmdisplay}"
+        )
+
+    def test_unwraps_empty_user_anchor_away_from_generated_marker(self):
+        content = (
+            r"\begin{algorithmdisplay}User text "
+            r"\hypertarget{user}{}"
+            r"\end{algorithmdisplay}"
+        )
+
+        assert self.apply(content) == (
+            r"\begin{algorithmdisplay}User text \end{algorithmdisplay}"
+        )
+
+    def test_incomplete_algorithm_anchor_keeps_reference_diagnostic(self, tmp_path):
+        content = (
+            r"\begin{algorithmdisplay}"
+            r"\hypertarget{alg:broken}{unfinished"
+            r"\end{algorithmdisplay}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_preprocess_links(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(item.code == "opaque-structure" for item in outcome.diagnostics)
+
     def test_hyperlink(self):
-        result = p._preprocess_hyperref_content(r"\hyperlink{target}{click here}")
+        result = self.apply(r"\hyperlink{target}{click here}")
         assert result == "click here"
 
 
-class TestNormalizeTableEnvs:
-    def test_tabu_to_tabular(self):
-        content = r"\begin{tabu} ... \end{tabu}"
-        result = p._normalize_table_envs_content(content)
-        assert r"\begin{tabular}" in result
-        assert r"\end{tabular}" in result
+class TestPlanNormalizeTables:
+    @pytest.mark.parametrize(("content", "expected"), [
+        (
+            r"\begin{tblr}{colspec={X[l]X[r]},rowsep=2pt}a&b\end{tblr}",
+            r"\begin{tabular}{l}a&b\end{tabular}",
+        ),
+        (
+            r"\begin{tabular}{l@{\hspace{1em}}r}a&b\end{tabular}",
+            r"\begin{tabular}{lr}a&b\end{tabular}",
+        ),
+    ])
+    def test_nested_table_arguments_remain_balanced(
+        self, content, expected, tmp_path,
+    ):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_tables(source, p.LatexDocument(source))
 
-    def test_tabularx_strips_width(self):
-        content = r"\begin{tabularx}{\textwidth}{lXr} ... \end{tabularx}"
-        result = p._normalize_table_envs_content(content)
-        assert r"\begin{tabular}" in result
-        assert r"\end{tabular}" in result
+        assert p.EditPlanner.apply(source, outcome.edits) == expected
 
-    def test_nicetabular(self):
-        content = r"\begin{NiceTabular} ... \end{NiceTabular}"
-        result = p._normalize_table_envs_content(content)
-        assert r"\begin{tabular}" in result
+    @pytest.mark.parametrize(("content", "expected"), [
+        (
+            r"\begin{tabularx}[t]{\textwidth}{lS[round-mode=places]r}x\end{tabularx}",
+            r"\begin{tabular}{lrr}x\end{tabular}",
+        ),
+        (
+            r"\begin{tabulary}{\linewidth}{@{\hspace{.5em}}lr}x\end{tabulary}",
+            r"\begin{tabular}{lr}x\end{tabular}",
+        ),
+        (
+            r"\begin{xltabular}{\linewidth}{lS[table-format=2.1]}x\end{xltabular}",
+            r"\begin{longtable}{lr}x\end{longtable}",
+        ),
+        (
+            r"\begin{NiceTabular}[small]{l@{x{y}}r}[hvlines]x\end{NiceTabular}",
+            r"\begin{tabular}{lr}x\end{tabular}",
+        ),
+        (
+            r"\begin{NiceTabular*}{\textwidth}[t]{lS[table-format=2.1]}[hvlines]x\end{NiceTabular*}",
+            r"\begin{tabular}{lr}x\end{tabular}",
+        ),
+        (
+            r"\begin{tabu}{lr}x\end{tabu}",
+            r"\begin{tabular}{lr}x\end{tabular}",
+        ),
+        (
+            r"\begin{ltablex}{lr}x\end{ltablex}",
+            r"\begin{longtable}{lr}x\end{longtable}",
+        ),
+    ])
+    def test_renames_environment_and_normalizes_parsed_column_spec(
+        self, content, expected, tmp_path,
+    ):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_tables(source, p.LatexDocument(source))
 
-    def test_tblr(self):
-        content = r"\begin{tblr}{colspec={ll}} ... \end{tblr}"
-        result = p._normalize_table_envs_content(content)
-        assert r"\begin{tabular}{l}" in result
-        assert r"\end{tabular}" in result
+        assert p.EditPlanner.apply(source, outcome.edits) == expected
 
-    def test_no_change_for_tabular(self):
-        content = r"\begin{tabular}{ll} ... \end{tabular}"
-        assert p._normalize_table_envs_content(content) == content
+    def test_multicolumn_column_spec_uses_balanced_groups(self, tmp_path):
+        content = r"\multicolumn{2}{l@{\hspace{1em}}S[table-format=2.1]}{value}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_tables(source, p.LatexDocument(source))
 
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"\multicolumn{2}{lr}{value}"
+        )
 
-class TestNormalizeCodeListings:
-    def test_minted_to_verbatim(self):
-        content = r"\begin{minted}{python}print()\end{minted}"
-        result = p._normalize_code_listings_content(content)
-        assert r"\begin{verbatim}" in result
-        assert r"\end{verbatim}" in result
-
-    def test_minted_with_options(self):
-        content = r"\begin{minted}[linenos]{python}code\end{minted}"
-        result = p._normalize_code_listings_content(content)
-        assert r"\begin{verbatim}" in result
-
-    def test_mintinline(self):
-        content = r"\mintinline{python}{x = 1}"
-        result = p._normalize_code_listings_content(content)
-        assert result == r"\texttt{x = 1}"
-
-    def test_lstlisting_options_stripped(self):
-        content = r"\begin{lstlisting}[language=C] code \end{lstlisting}"
-        result = p._normalize_code_listings_content(content)
-        assert r"\begin{lstlisting}" in result
-        assert "[language=C]" not in result
-
-
-class TestNormalizeSiunitx:
-    def test_s_column_replaced(self):
-        content = r"\begin{tabular}{lSr}"
-        result = p._normalize_siunitx_content(content)
-        assert r"\begin{tabular}{lrr}" == result
-
-    def test_s_with_options(self):
-        content = r"\begin{tabular}{S[round-mode=places] l}"
-        result = p._normalize_siunitx_content(content)
-        assert r"\begin{tabular}{r l}" == result
-
-    def test_no_s_columns_unchanged(self):
-        content = r"\begin{tabular}{l c r}"
-        assert p._normalize_siunitx_content(content) == content
-
-
-class TestRemoveResizebox:
-    def test_basic(self):
-        assert p._remove_resizebox(r"\resizebox{1cm}{!}{content}") == "content"
-
-    def test_star(self):
-        assert p._remove_resizebox(r"\resizebox*{1cm}{!}{content}") == "content"
-
-    def test_surrounding_text(self):
-        result = p._remove_resizebox(r"before \resizebox{w}{h}{inner} after")
-        assert result == "before inner after"
-
-
-class TestRemoveAdjustboxCmd:
-    def test_basic(self):
-        assert p._remove_adjustbox_cmd(r"\adjustbox{width=5cm}{table content}") == "table content"
-
-    def test_not_adjustboxes(self):
-        text = r"\adjustboxes is a word"
-        assert p._remove_adjustbox_cmd(text) == text
-
-
-class TestReplaceCaptionof:
-    def test_basic_conversion(self):
+    def test_repeated_column_spec_is_normalized_recursively(self, tmp_path):
         content = (
-            r"\begin{minipage}{\textwidth}"
-            r"\includegraphics{fig}"
-            r"\captionof{figure}{A figure}"
+            r"\begin{tabular}{*{2}{S[table-format=2.1]@{\hspace{1em}}}}"
+            r"a&b\end{tabular}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_tables(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"\begin{tabular}{*{2}{r}}a&b\end{tabular}"
+        )
+
+    def test_incomplete_column_spec_is_preserved(self, tmp_path):
+        content = r"\begin{tabular}{l@{\hspace{1em}}r"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_tables(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(
+            diagnostic.code == "opaque-structure"
+            for diagnostic in outcome.diagnostics
+        )
+
+    @pytest.mark.parametrize("content", [
+        r"\begin{NiceTabular}{lr}[hvlines x\end{NiceTabular}",
+        r"\begin{NiceTabular}{lr} [hvlines x\end{NiceTabular}",
+    ])
+    def test_incomplete_nicetabular_trailing_options_are_preserved(
+        self, content, tmp_path,
+    ):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_tables(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(
+            diagnostic.code == "opaque-structure"
+            for diagnostic in outcome.diagnostics
+        )
+
+    @pytest.mark.parametrize("content", [
+        r"\begin{tblr}{colspec={X[l]X[r]},rowsep=2pt}a&b\end{tblr}",
+        r"\begin{tabularx}{\textwidth}{l@{x{y}}S[table-format=2.1]}a&b\end{tabularx}",
+        r"\multicolumn{2}{l@{\hspace{1em}}S[table-format=2.1]}{value}",
+    ])
+    def test_apply_reparse_replan_is_idempotent(self, content, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        first = p.EditPlanner.apply(
+            source,
+            p.plan_normalize_tables(source, p.LatexDocument(source)).edits,
+        )
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_normalize_tables(
+            rewritten, p.LatexDocument(rewritten),
+        )
+
+        assert p.EditPlanner.apply(rewritten, second.edits) == first
+
+
+class TestPlanTableFloatWrappers:
+    @staticmethod
+    def apply(tmp_path, content, planner):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = planner(source, p.LatexDocument(source))
+        return p.EditPlanner.apply(source, outcome.edits), outcome
+
+    @pytest.mark.parametrize(("planner", "content", "expected"), [
+        (
+            p.plan_unwrap_makecells,
+            r"\makecell[c]{A \\[2pt] \makecell{B \\ C}}",
+            "A B C",
+        ),
+        (
+            p.plan_unwrap_resizeboxes,
+            r"\resizebox*{\textwidth}{!}{A \resizebox{1cm}{!}{B}}",
+            "A B",
+        ),
+        (
+            p.plan_unwrap_adjustboxes,
+            r"\begin{adjustbox}{width=1cm}A \adjustbox{max width=1cm}{B}\end{adjustbox}",
+            "A B",
+        ),
+        (
+            p.plan_convert_wrapfigures,
+            r"\begin{wrapfigure}[2]{r}{.5\textwidth}img\end{wrapfigure}",
+            r"\begin{figure}[H]img\end{figure}",
+        ),
+        (
+            p.plan_unwrap_subfigures,
+            r"\begin{subfigure}[b]{.5\textwidth}img\end{subfigure}",
+            "img",
+        ),
+        (
+            p.plan_destar_floats,
+            r"\begin{table*}a\end{table*}\begin{figure*}b\end{figure*}",
+            r"\begin{table}a\end{table}\begin{figure}b\end{figure}",
+        ),
+    ])
+    def test_planners_handle_nested_or_argument_bearing_syntax(
+        self, tmp_path, planner, content, expected,
+    ):
+        actual, _ = self.apply(tmp_path, content, planner)
+        assert actual == expected
+
+    @pytest.mark.parametrize("planner,content", [
+        (p.plan_unwrap_makecells, r"\makecell[c]{A"),
+        (p.plan_unwrap_resizeboxes, r"\resizebox{1cm}{!}{A"),
+        (p.plan_unwrap_adjustboxes, r"\begin{adjustbox}{width=1cm}A"),
+        (p.plan_unwrap_minipages, r"\begin{minipage}{2cm}A"),
+        (p.plan_convert_wrapfigures, r"\begin{wrapfigure}{r}{2cm}A"),
+        (p.plan_unwrap_subfigures, r"\begin{subfigure}{2cm}A"),
+    ])
+    def test_malformed_wrappers_are_preserved_with_diagnostic(
+        self, tmp_path, planner, content,
+    ):
+        actual, outcome = self.apply(tmp_path, content, planner)
+        assert actual == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    @pytest.mark.parametrize("planner,content", [
+        (p.plan_unwrap_makecells, r"\makecell{A \\ \makecell{B \\ C}}"),
+        (p.plan_unwrap_resizeboxes, r"\resizebox{1cm}{!}{\resizebox{2cm}{!}{x}}"),
+        (p.plan_unwrap_adjustboxes, r"\begin{adjustbox}{width=1cm}\adjustbox{x}{y}\end{adjustbox}"),
+        (p.plan_unwrap_minipages, r"\begin{minipage}{2cm}\begin{minipage}{1cm}x\end{minipage}\end{minipage}"),
+        (p.plan_convert_wrapfigures, r"\begin{wrapfigure}{r}{2cm}x\end{wrapfigure}"),
+        (p.plan_unwrap_subfigures, r"\begin{subfigure}{2cm}x\end{subfigure}"),
+        (p.plan_destar_floats, r"\begin{figure*}x\end{figure*}"),
+    ])
+    def test_apply_reparse_replan_is_idempotent(
+        self, tmp_path, planner, content,
+    ):
+        first, _ = self.apply(tmp_path, content, planner)
+        rewritten = p.SourceFile(tmp_path / "main.tex", first)
+        second = planner(rewritten, p.LatexDocument(rewritten))
+        assert second.edits == ()
+
+    def test_starred_resizebox_inside_opaque_ancestor_is_preserved(
+        self, tmp_path,
+    ):
+        content = r"\section{outer \resizebox*{1cm}{!}{inner}"
+
+        actual, outcome = self.apply(
+            tmp_path, content, p.plan_unwrap_resizeboxes,
+        )
+
+        assert actual == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_starred_resizebox_with_foreign_reference_is_preserved(
+        self, tmp_path,
+    ):
+        content = r"\resizebox*{1cm}{!}{inner}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        foreign = p.SourceFile(tmp_path / "foreign.tex", content)
+
+        outcome = p.plan_unwrap_resizeboxes(
+            source, p.LatexDocument(foreign),
+        )
+
+        assert outcome.edits == ()
+        assert any(d.code == "foreign-reference" for d in outcome.diagnostics)
+
+    def test_fragment_planner_maps_diagnostic_to_parent_source(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", "prefix INNER suffix")
+        start = source.content.index("INNER")
+        end = start + len("INNER")
+
+        def diagnose(fragment, document):
+            return p.PlanOutcome(diagnostics=(p.Diagnostic(
+                p.Path("<fragment>"),
+                "inner_planner",
+                "opaque-structure",
+                "nested malformed wrapper",
+                1,
+                4,
+            ),))
+
+        outcome = p._apply_fragment_planner(
+            source,
+            start,
+            end,
+            diagnose,
+            "outer_planner",
+            p.Safety.LOSSY,
+        )
+
+        assert outcome.edits == ()
+        assert outcome.diagnostics == (p.Diagnostic(
+            source.path,
+            "inner_planner",
+            "opaque-structure",
+            "nested malformed wrapper",
+            start + 1,
+            start + 4,
+        ),)
+
+    @pytest.mark.parametrize(("planner", "fragment"), [
+        (p.plan_unwrap_makecells, r"\makecell"),
+        (p.plan_unwrap_resizeboxes, r"\resizebox{1cm}"),
+        (p.plan_unwrap_adjustboxes, r"\adjustbox{width=1cm}"),
+    ], ids=("makecell", "resizebox", "adjustbox"))
+    def test_nested_malformed_fragment_diagnostic_uses_parent_coordinates(
+        self, tmp_path, planner, fragment,
+    ):
+        content = f"prefix {fragment} suffix"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        start = content.index(fragment)
+        end = start + len(fragment)
+
+        outcome = p._apply_fragment_planner(
+            source, start, end, planner, "outer", p.Safety.LOSSY,
+        )
+
+        assert outcome.edits == ()
+        assert outcome.diagnostics
+        assert all(d.file == source.path for d in outcome.diagnostics)
+        assert all(
+            d.start is None or start <= d.start <= d.end <= end
+            for d in outcome.diagnostics
+        )
+
+    @pytest.mark.parametrize(("planner", "content"), [
+        (p.plan_unwrap_makecells, r"\makecell{outer}"),
+        (p.plan_unwrap_resizeboxes, r"\resizebox{1cm}{!}{outer}"),
+        (p.plan_unwrap_adjustboxes, r"\adjustbox{width=1cm}{outer}"),
+    ], ids=("makecell", "resizebox", "adjustbox"))
+    def test_outer_wrapper_preserves_nested_fragment_diagnostic(
+        self, tmp_path, monkeypatch, planner, content,
+    ):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        def malformed_fragment(
+            parent, start, end, nested_planner, pass_name, safety,
+        ):
+            return p.PlanOutcome(
+                edits=(p.Edit(
+                    parent.path, start, end, "nested", pass_name, safety,
+                ),),
+                diagnostics=(p.Diagnostic(
+                    parent.path,
+                    nested_planner.__name__,
+                    "opaque-structure",
+                    "nested malformed wrapper",
+                    start,
+                    end,
+                ),),
+            )
+
+        monkeypatch.setattr(p, "_apply_fragment_planner", malformed_fragment)
+
+        outcome = planner(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == "nested"
+        assert len(outcome.edits) == 1
+        assert outcome.edits[0].safety is p.Safety.LOSSY
+        assert outcome.diagnostics[0].code == "opaque-structure"
+        assert outcome.diagnostics[0].file == source.path
+
+
+class TestMinipageCaptionInteractions:
+    @staticmethod
+    def run_ordered(tmp_path, content):
+        main = tmp_path / "main.tex"
+        main.write_text(content)
+        specs = p.build_table_float_passes()
+        result = p.PassPipeline(specs).run(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        return result.snapshot.sources[main].content
+
+    def test_standalone_minipage_is_unwrapped(self, tmp_path):
+        assert self.run_ordered(
+            tmp_path, r"\begin{minipage}{2cm}body\end{minipage}",
+        ) == "body"
+
+    def test_nested_minipages_are_unwrapped_without_overlap(self, tmp_path):
+        content = (
+            r"\begin{minipage}{2cm}outer "
+            r"\begin{minipage}{1cm}inner\end{minipage}"
             r"\end{minipage}"
         )
-        result = p._replace_captionof_blocks(content)
-        assert r"\begin{figure}[H]" in result
-        assert r"\end{figure}" in result
-        assert r"\caption{A figure}" in result
+        assert self.run_ordered(tmp_path, content) == "outer inner"
 
-    def test_no_captionof_unchanged(self):
-        content = r"\begin{minipage}{\textwidth}text\end{minipage}"
-        assert p._replace_captionof_blocks(content) == content
+    @pytest.mark.parametrize("outer", ["table", "tabular"])
+    def test_minipage_inside_table_structure_is_unwrapped(
+        self, tmp_path, outer,
+    ):
+        argument = "{c}" if outer == "tabular" else ""
+        content = (
+            f"\\begin{{{outer}}}{argument}"
+            r"\begin{minipage}{2cm}cell\end{minipage}"
+            f"\\end{{{outer}}}"
+        )
+        result = self.run_ordered(tmp_path, content)
+        assert "minipage" not in result
+        assert f"\\begin{{{outer}}}" in result
 
+    def test_captionof_standalone_minipage_becomes_float(self, tmp_path):
+        content = (
+            r"\begin{minipage}{\textwidth}img"
+            r"\captionof{figure}{Caption}\end{minipage}"
+        )
+        assert self.run_ordered(tmp_path, content) == (
+            r"\begin{figure}[H]img\caption{Caption}\end{figure}"
+        )
 
-# ── Float/figure transforms ────────────────────────────────────────────────
+    def test_captionof_table_does_not_nest_same_type_float(self, tmp_path):
+        content = (
+            r"\begin{table}\begin{minipage}{\textwidth}x"
+            r"\captionof{table}{Caption}\end{minipage}\end{table}"
+        )
+        result = self.run_ordered(tmp_path, content)
+        assert result == r"\begin{table}x\caption{Caption}\end{table}"
+        assert result.count(r"\begin{table}") == 1
+
+    def test_captionof_table_inside_starred_table_does_not_nest(
+        self, tmp_path,
+    ):
+        content = (
+            r"\begin{table*}\begin{minipage}{\textwidth}x"
+            r"\captionof{table}{Caption}\end{minipage}\end{table*}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        resolved = p.EditPlanner.apply(
+            source,
+            p.plan_resolve_captionof(source, p.LatexDocument(source)).edits,
+        )
+        resolved_source = p.SourceFile(source.path, resolved)
+        result = p.EditPlanner.apply(
+            resolved_source,
+            p.plan_destar_floats(
+                resolved_source, p.LatexDocument(resolved_source),
+            ).edits,
+        )
+
+        assert result == r"\begin{table}x\caption{Caption}\end{table}"
+        assert result.count(r"\begin{table}") == 1
+
+    def test_additional_captionof_in_same_minipage_is_preserved(
+        self, tmp_path,
+    ):
+        content = (
+            r"\begin{minipage}{\textwidth}x"
+            r"\captionof{figure}{First}\captionof{figure}{Second}"
+            r"\end{minipage}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        result = p.EditPlanner.apply(
+            source,
+            p.plan_resolve_captionof(source, p.LatexDocument(source)).edits,
+        )
+
+        assert r"\caption{First}" in result
+        assert r"\captionof{figure}{Second}" in result
+
+    def test_pass_order_preserves_caption_wrapper_until_resolution(self):
+        specs = p.build_table_float_passes()
+        by_name = {spec.name: spec for spec in specs}
+        assert "normalize_tables" in by_name["unwrap_makecell"].after
+        assert "resolve_captionof" in by_name["unwrap_minipages"].after
+        assert "normalize_tables" in by_name["unwrap_minipages"].after
+        assert "resolve_captionof" in by_name["destar_floats"].after
+        ordered = [spec.name for spec in p.resolve_pass_order(specs)]
+        assert ordered.index("resolve_captionof") < ordered.index("unwrap_minipages")
+        assert ordered.index("resolve_captionof") < ordered.index("destar_floats")
+        assert ordered.index("normalize_tables") < ordered.index("unwrap_makecell")
 
 
 class TestDestarFloats:
@@ -881,19 +2829,21 @@ class TestDestarFloats:
 
 
 class TestConvertWrapfigure:
-    def test_basic(self):
+    def test_basic(self, tmp_path):
         content = r"\begin{wrapfigure}{r}{0.5\textwidth}img\end{wrapfigure}"
-        result = p._WRAPFIG_RE.sub(r"\\begin{figure}[H]", content).replace(
-            "\\end{wrapfigure}", "\\end{figure}"
-        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_convert_wrapfigures(source, p.LatexDocument(source))
+        result = p.EditPlanner.apply(source, outcome.edits)
         assert r"\begin{figure}[H]" in result
         assert r"\end{figure}" in result
 
 
 class TestUnwrapSubfigures:
-    def test_basic(self):
+    def test_basic(self, tmp_path):
         content = r"\begin{subfigure}[b]{0.5\textwidth}img\end{subfigure}"
-        result = p._SUBFIG_BEGIN_RE.sub("", content).replace("\\end{subfigure}", "")
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_unwrap_subfigures(source, p.LatexDocument(source))
+        result = p.EditPlanner.apply(source, outcome.edits)
         assert "subfigure" not in result
         assert "img" in result
 
@@ -902,19 +2852,17 @@ class TestUnwrapSubfigures:
 
 
 class TestDingMap:
-    def test_checkmark(self):
-        result = p._DING_RE.sub(
-            lambda m: p.DING_MAP.get(m.group(1), m.group(0)),
-            r"\ding{51}",
-        )
-        assert result == "✓"
+    @staticmethod
+    def apply(tmp_path, content):
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_inline_symbols(source, p.LatexDocument(source))
+        return p.EditPlanner.apply(source, outcome.edits)
 
-    def test_unknown_code_preserved(self):
-        result = p._DING_RE.sub(
-            lambda m: p.DING_MAP.get(m.group(1), m.group(0)),
-            r"\ding{999}",
-        )
-        assert result == r"\ding{999}"
+    def test_checkmark(self, tmp_path):
+        assert self.apply(tmp_path, r"\ding{51}") == "✓"
+
+    def test_unknown_code_preserved(self, tmp_path):
+        assert self.apply(tmp_path, r"\ding{999}") == r"\ding{999}"
 
 
 # ── Translation helpers ────────────────────────────────────────────────────
@@ -935,17 +2883,31 @@ class TestExtractGlossary:
 
 
 class TestExtractSectionHeadings:
+    @staticmethod
+    def extract(tmp_path, tex):
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, tex)
+        return p.extract_snapshot_section_headings(snapshot)
+
     def test_supports_optional_arguments_and_nested_commands(self, tmp_path):
         tex = tmp_path / "section.tex"
         tex.write_text(r"\section[Short]{About \textbf{Method}}")
 
-        assert p.extract_section_headings([tex]) == [r"About \textbf{Method}"]
+        assert self.extract(tmp_path, tex) == [r"About \textbf{Method}"]
 
     def test_includes_paragraph_with_nested_title(self, tmp_path):
         tex = tmp_path / "section.tex"
         tex.write_text(r"\paragraph[Short]{About \textbf{Method}}")
 
-        assert p.extract_section_headings([tex]) == [r"About \textbf{Method}"]
+        assert self.extract(tmp_path, tex) == [r"About \textbf{Method}"]
+
+    def test_excludes_headings_inside_translation_skip_environment(self, tmp_path):
+        tex = tmp_path / "section.tex"
+        tex.write_text(
+            r"\section{Visible}"
+            r"\begin{figure}\section{Hidden}\end{figure}"
+        )
+
+        assert self.extract(tmp_path, tex) == ["Visible"]
 
 
 class TestTranslateHeadings:
@@ -967,6 +2929,57 @@ class TestTranslateHeadings:
 
         assert result.count("共享") == 1
 
+    def test_inserts_after_complete_nested_label_argument(self):
+        content = r"\section{Intro}\label{sec:{nested}}" + "\nBody."
+
+        result = p._translate_headings({"Intro": "引言"}, content)
+
+        assert r"\label{sec:{nested}}" + "\n\n引言\n" in result
+
+    def test_does_not_insert_inside_translation_skip_environment(self):
+        content = (
+            r"\section{Visible}"
+            r"\begin{figure}\section{Hidden}\end{figure}"
+        )
+
+        result = p._translate_headings(
+            {"Visible": "可见", "Hidden": "隐藏"}, content,
+        )
+
+        assert "可见" in result
+        assert "隐藏" not in result
+
+    def test_crlf_heading_translation_preserves_newline_convention(self):
+        content = r"\section{Intro}" + "\r\nBody."
+
+        first = p._translate_headings({"Intro": "引言"}, content)
+        second = p._translate_headings({"Intro": "引言"}, first)
+
+        assert b"\n" not in first.encode().replace(b"\r\n", b"")
+        assert second == first
+
+
+def test_crlf_paragraph_translation_preserves_separators_and_is_idempotent(
+    monkeypatch,
+):
+    content = (
+        "First English paragraph with enough words for translation.\r\n\r\n"
+        "Second English paragraph with enough words for translation."
+    )
+    monkeypatch.setattr(
+        p, "_batch_translate",
+        lambda client, glossary, numbered: {
+            index: f"中文段落{index}。" for index in numbered
+        },
+    )
+
+    first = p.translate_file_content(object(), "", {}, content)
+    second = p.translate_file_content(object(), "", {}, first)
+
+    assert b"\n" not in first.encode().replace(b"\r\n", b"")
+    assert "\r\n\r\n" in first
+    assert second == first
+
 
 class TestTranslateFileContent:
     def test_paragraph_heading_is_not_duplicated(self, monkeypatch):
@@ -983,46 +2996,107 @@ class TestTranslateFileContent:
         assert r"\paragraph{贡献。}" not in result
         assert "贡献。" in result
 
-
-class TestTranslateTexFiles:
-    def test_translates_main_body_and_deduplicates_headings(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_multiline_translation_range_is_idempotent_without_api_recall(
+        self, monkeypatch, newline
     ):
-        main = tmp_path / "main.tex"
-        child = tmp_path / "child.tex"
-        main.write_text(
-            "\\documentclass{article}\n\\begin{document}\n"
-            "\\section{Intro}\nMain body with enough prose.\n"
-            "\\input{child}\n\\end{document}\n"
+        content = (
+            "English paragraph with enough words for translation."
+            + (newline if newline == "\r\n" else "")
         )
-        child.write_text("\\section{Intro}\nChild body with enough prose.\n")
-        heading_calls = []
-        translated_bodies = []
+        calls = []
 
-        monkeypatch.setattr(p, "extract_glossary", lambda *args: "term | 术语")
+        def translate(client, glossary, numbered):
+            calls.append(dict(numbered))
+            return {0: f"Chinese first part.{newline}{newline}Chinese second part."}
 
-        def fake_heading_texts(client, glossary, texts):
-            heading_calls.append(texts)
-            return {0: "引言"}
+        monkeypatch.setattr(p, "_batch_translate", translate)
+        first = p.translate_file_content(object(), "", {}, content)
+        second = p.translate_file_content(object(), "", {}, first)
 
-        def fake_translate(client, glossary, heading_map, content):
-            translated_bodies.append(content)
-            assert heading_map == {"Intro": "引言"}
-            return content + "\n译文"
+        assert len(calls) == 1
+        assert second == first
+        assert "% paper2epub:translation-begin:" in first
+        assert "% paper2epub:translation-end:" in first
+        if newline == "\r\n":
+            assert "\n" not in first.replace("\r\n", "")
 
-        monkeypatch.setattr(p, "_translate_heading_texts", fake_heading_texts)
-        monkeypatch.setattr(p, "translate_file_content", fake_translate)
-
-        p.translate_tex_files(tmp_path, main, object(), "Title")
-
-        assert heading_calls == [["Intro"]]
-        assert len(translated_bodies) == 2
-        assert "Main body" in main.read_text()
-        assert main.read_text().count("译文") == 1
-        assert main.read_text().index("译文") < main.read_text().index(
-            r"\end{document}"
+    def test_plain_legacy_marker_does_not_suppress_translation(self, monkeypatch):
+        content = (
+            "First English paragraph with enough words for translation.\n\n"
+            "% paper2epub:translation\n\n"
+            "Second English paragraph with enough words for translation."
         )
-        assert child.read_text().count("译文") == 1
+        seen = []
+        monkeypatch.setattr(
+            p, "_batch_translate",
+            lambda client, glossary, numbered: (
+                seen.append(dict(numbered))
+                or {index: f"Chinese {index}." for index in numbered}
+            ),
+        )
+
+        result = p.translate_file_content(object(), "", {}, content)
+
+        assert len(seen[0]) == 2
+        assert "% paper2epub:translation" in result
+
+    @pytest.mark.parametrize("closed", [True, False])
+    def test_unbound_or_unclosed_marker_does_not_swallow_user_text(
+        self, monkeypatch, closed
+    ):
+        paragraph = "English paragraph with enough words for translation."
+        wrong_digest = "0" * 64
+        marker_text = (
+            f"% paper2epub:translation-begin:{wrong_digest}\n"
+            "User-authored text inside marker-like lines."
+        )
+        if closed:
+            marker_text += f"\n% paper2epub:translation-end:{wrong_digest}"
+        content = paragraph + "\n\n" + marker_text
+        seen = []
+        monkeypatch.setattr(
+            p, "_batch_translate",
+            lambda client, glossary, numbered: (
+                seen.append(dict(numbered))
+                or {index: f"Chinese {index}." for index in numbered}
+            ),
+        )
+
+        result = p.translate_file_content(object(), "", {}, content)
+
+        assert paragraph in seen[0].values()
+        assert marker_text in result
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_heading_and_paragraph_share_stable_translation_identity(
+        self, monkeypatch, newline
+    ):
+        content = (
+            r"\paragraph{Contributions.}" + newline
+            + "Body prose has enough English words for paragraph translation."
+        )
+        calls = []
+        monkeypatch.setattr(
+            p, "_batch_translate",
+            lambda client, glossary, numbered: (
+                calls.append(dict(numbered)) or {0: "Chinese body."}
+            ),
+        )
+
+        first = p.translate_file_content(
+            object(), "", {"Contributions.": "贡献。"}, content
+        )
+        second = p.translate_file_content(
+            object(), "", {"Contributions.": "贡献。"}, first
+        )
+
+        assert len(calls) == 1
+        assert second == first
+        assert first.count("% paper2epub:translation-begin:") == 1
+        assert first.count("% paper2epub:heading-translation") == 1
+        if newline == "\r\n":
+            assert "\n" not in first.replace("\r\n", "")
 
 
 class TestIsProse:
@@ -1048,6 +3122,16 @@ class TestIsProse:
             r"We define the function $f(x) = x^2$ and the variable $y$ for this problem."
         )
 
+    def test_nested_structural_command_is_not_literal_prose(self):
+        assert not p._is_prose(
+            r"\label{thisisaverylong{nested}structuralidentifier}"
+        )
+
+    def test_counts_literal_text_inside_formatting_command(self):
+        assert p._is_prose(
+            r"\textbf{This is a complete prose sentence inside formatting.}"
+        )
+
 
 class TestFindSkipRanges:
     def test_single_env(self):
@@ -1059,11 +3143,26 @@ class TestFindSkipRanges:
     def test_nested(self):
         content = r"\begin{table}\begin{tabular}x\end{tabular}\end{table}"
         ranges = p._find_skip_ranges(content)
-        assert len(ranges) == 2
+        assert ranges == [(0, len(content))]
 
     def test_no_skip_envs(self):
         content = r"\begin{document}text\end{document}"
         assert p._find_skip_ranges(content) == []
+
+    def test_nested_same_name_uses_outermost_trusted_range(self, tmp_path):
+        content = (
+            "Prose before.\n\n"
+            r"\begin{figure}outer \begin{figure}inner\end{figure} tail\end{figure}"
+            "\n\nProse after."
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        ranges = p.translation_skip_ranges(p.LatexDocument(source))
+
+        assert len(ranges) == 1
+        assert source.content[ranges[0][0]:ranges[0][1]].startswith(
+            r"\begin{figure}"
+        )
 
 
 class TestChunkInSkipRange:
@@ -1075,15 +3174,6 @@ class TestChunkInSkipRange:
 
     def test_overlapping(self):
         assert p._chunk_in_skip_range(15, 25, [(0, 20)])
-
-
-class TestSplitIntoChunks:
-    def test_basic(self):
-        chunks = p._split_into_chunks("a\n\nb\n\nc")
-        assert chunks == ["a", "b", "c"]
-
-    def test_no_split(self):
-        assert p._split_into_chunks("single paragraph") == ["single paragraph"]
 
 
 class TestStripEnvWrappers:
@@ -1128,6 +3218,224 @@ class TestStripHeadingLines:
     def test_preserves_non_heading(self):
         text = "Just a paragraph."
         assert p._strip_heading_lines(text) == text
+
+    def test_strips_adjacent_complete_label_with_nested_argument(self):
+        text = r"\section{Intro}\label{sec:{nested}} Body text."
+
+        assert p._strip_heading_lines(text) == "Body text."
+
+
+class TestTranslationBarrier:
+    @staticmethod
+    def snapshot(tmp_path, main_content, child_content=None):
+        main = tmp_path / "main.tex"
+        main.write_text(main_content)
+        if child_content is not None:
+            child = tmp_path / "child.tex"
+            child.write_text(child_content)
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        return main, snapshot
+
+    def test_failure_returns_no_partial_snapshot_or_disk_writes(self, tmp_path):
+        main, snapshot = self.snapshot(
+            tmp_path,
+            r"\begin{document}Main prose.\input{child}\end{document}",
+            "Child prose with enough English words for translation.",
+        )
+        child = tmp_path / "child.tex"
+
+        def translate(source, discovery):
+            if source.path == child:
+                raise RuntimeError("translation failed")
+            return source.content + " translated"
+
+        with pytest.raises(RuntimeError, match="translation failed"):
+            p.TranslationBarrier(translate, max_workers=1).run(snapshot)
+
+        assert snapshot.sources[main].content.startswith(r"\begin{document}")
+        assert snapshot.sources[child].content.startswith("Child prose")
+        assert main.read_text().startswith(r"\begin{document}")
+        assert child.read_text().startswith("Child prose")
+
+    def test_success_splices_main_body_and_invalidates_syntax(self, tmp_path):
+        main, snapshot = self.snapshot(
+            tmp_path,
+            r"\documentclass{article}\begin{document}Main prose.\input{child}\end{document}",
+            "Child prose.",
+        )
+        seen = {}
+
+        def translate(source, discovery):
+            seen[source.path] = source.content
+            return source.content + " translated"
+
+        result = p.TranslationBarrier(translate, max_workers=1).run(snapshot)
+        child = tmp_path / "child.tex"
+
+        assert seen[main] == r"Main prose.\input{child}"
+        assert seen[child] == "Child prose."
+        assert result.snapshot.sources[main].content == (
+            r"\documentclass{article}\begin{document}"
+            r"Main prose.\input{child} translated\end{document}"
+        )
+        assert result.snapshot.sources[child].content == "Child prose. translated"
+        assert result.snapshot.revision == snapshot.revision + 1
+        assert result.snapshot.documents == {}
+        assert p.Fact.SYNTAX not in result.snapshot.current_facts
+        assert p.Fact.DISCOVERY in result.snapshot.current_facts
+        assert main.read_text() == (
+            r"\documentclass{article}\begin{document}"
+            r"Main prose.\input{child}\end{document}"
+        )
+
+    def test_incomplete_main_document_is_preserved_with_diagnostic(self, tmp_path):
+        content = r"\begin{document}Unfinished main prose."
+        main, snapshot = self.snapshot(tmp_path, content)
+        calls = []
+
+        result = p.TranslationBarrier(
+            lambda source, discovery: calls.append(source.path) or "changed",
+        ).run(snapshot)
+
+        assert calls == []
+        assert result.snapshot is snapshot
+        assert main.read_text() == content
+        assert any(d.code == "opaque-structure" for d in result.diagnostics)
+
+    def test_missing_main_document_preserves_main_but_translates_child(
+        self, tmp_path
+    ):
+        main_content = r"\documentclass{article}\input{child}"
+        child_content = "Child prose with enough English words for translation."
+        main, snapshot = self.snapshot(tmp_path, main_content, child_content)
+        child = tmp_path / "child.tex"
+        calls = []
+
+        def translate(source, discovery):
+            calls.append(source.path)
+            return source.content + " translated"
+
+        result = p.TranslationBarrier(translate, max_workers=1).run(snapshot)
+
+        assert calls == [child]
+        assert result.snapshot.sources[main].content == main_content
+        assert result.snapshot.sources[child].content == child_content + " translated"
+        assert [d.code for d in result.diagnostics] == ["missing-document"]
+        assert result.diagnostics[0].file == main
+
+    def test_multifile_translation_preserves_crlf_and_is_idempotent(
+        self, tmp_path, monkeypatch
+    ):
+        main_content = (
+            "\\documentclass{article}\r\n"
+            "\\begin{document}\r\n"
+            "Main prose has enough English words for translation.\r\n\r\n"
+            "\\input{child}\r\n"
+            "\\end{document}\r\n"
+        )
+        child_content = (
+            "Child prose also has enough English words for translation.\r\n"
+        )
+        main = tmp_path / "main.tex"
+        child = tmp_path / "child.tex"
+        main.write_bytes(main_content.encode())
+        child.write_bytes(child_content.encode())
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        monkeypatch.setattr(
+            p,
+            "_batch_translate",
+            lambda client, glossary, numbered: {
+                i: f"Chinese translation {i}." for i in numbered
+            },
+        )
+
+        def translate(source, discovery):
+            return p.translate_file_content(object(), "", {}, source.content)
+
+        first = p.TranslationBarrier(translate, max_workers=1).run(snapshot)
+        rebuilt = p.rebuild_syntax(first.snapshot)
+        second = p.TranslationBarrier(translate, max_workers=1).run(rebuilt)
+
+        for path in (main, child):
+            translated = first.snapshot.sources[path].content
+            assert "\n" not in translated.replace("\r\n", "")
+            assert second.snapshot.sources[path].content == translated
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_heading_paragraph_barrier_second_run_needs_no_api_call(
+        self, tmp_path, monkeypatch, newline
+    ):
+        content = (
+            r"\begin{document}"
+            + r"\paragraph{Contributions.}" + newline
+            + "Body prose has enough English words for paragraph translation."
+            + r"\end{document}"
+        )
+        main = tmp_path / "main.tex"
+        main.write_bytes(content.encode())
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        calls = []
+        monkeypatch.setattr(
+            p, "_batch_translate",
+            lambda client, glossary, numbered: (
+                calls.append(dict(numbered)) or {0: "Chinese body."}
+            ),
+        )
+
+        def translate(source, discovery):
+            return p.translate_file_content(
+                object(), "", {"Contributions.": "贡献。"}, source.content
+            )
+
+        first = p.TranslationBarrier(translate, max_workers=1).run(snapshot)
+        second = p.TranslationBarrier(translate, max_workers=1).run(
+            p.rebuild_syntax(first.snapshot)
+        )
+
+        assert len(calls) == 1
+        assert second.snapshot.sources[main].content == first.snapshot.sources[main].content
+        assert first.snapshot.sources[main].content.count(
+            "% paper2epub:translation-begin:"
+        ) == 1
+
+    def test_rebuilds_syntax_before_post_translation_paragraph_plan(self, tmp_path):
+        main, snapshot = self.snapshot(
+            tmp_path, r"\paragraph{Title} Body text.",
+        )
+        barrier = p.TranslationBarrier(
+            lambda source, discovery: source.content + " translated",
+        ).run(snapshot)
+
+        rebuilt = p.rebuild_syntax(barrier.snapshot)
+        edits = p.plan_unnumber_paragraphs(
+            rebuilt.sources[main], rebuilt.documents[main],
+        )
+
+        assert p.Fact.SYNTAX in rebuilt.current_facts
+        assert p.EditPlanner.apply(rebuilt.sources[main], edits).startswith(
+            r"\paragraph*{Title}"
+        )
+
+    def test_rejects_discovery_object_without_current_fact(self, tmp_path):
+        _, snapshot = self.snapshot(tmp_path, "Current prose.")
+        stale = p.replace(
+            snapshot,
+            current_facts=snapshot.current_facts - {p.Fact.DISCOVERY},
+        )
+        calls = []
+
+        with pytest.raises(p.PipelineContractError, match="discovery"):
+            p.TranslationBarrier(
+                lambda source, discovery: calls.append(source.path) or source.content,
+            ).run(stale)
+
+        assert calls == []
 
 
 # ── Algorithm preprocessing ────────────────────────────────────────────────
@@ -1190,93 +3498,314 @@ class TestReplaceCallInText:
         text = "no calls here"
         assert p.replace_call_in_text(text) == text
 
+    @pytest.mark.parametrize("text", [
+        r"\\Call{Escaped}{x}",
+        "% \\Call{Commented}{x}\ntext",
+        r"\Caller{Partial}{x}",
+        r"\Call{MissingSecond}",
+    ])
+    def test_non_command_or_malformed_call_is_preserved(self, text):
+        assert p.replace_call_in_text(text) == text
+
+    def test_nested_call_arguments_are_parser_owned(self):
+        text = r"\Call{Foo {Bar}}{{x_{i}}, \textbf{y}}"
+        assert p.replace_call_in_text(text) == (
+            r"\operatorname{Foo {Bar}}({x_{i}}, \textbf{y})"
+        )
+
+    def test_malformed_call_planner_emits_diagnostic(self, tmp_path):
+        content = r"before \Call{MissingSecond} after"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_replace_calls(source, p.LatexDocument(source))
+
+        assert outcome.edits == ()
+        assert p.EditPlanner.apply(source, outcome.edits) == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_call_rewrite_is_idempotent(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", r"\Call{Foo}{x}")
+        first = p.EditPlanner.apply(
+            source, p.plan_replace_calls(source, p.LatexDocument(source)).edits,
+        )
+        rewritten = p.SourceFile(source.path, first)
+
+        second = p.plan_replace_calls(rewritten, p.LatexDocument(rewritten))
+
+        assert second.edits == ()
+
 
 class TestNormalizeTextsc:
-    def test_replaces_textsc(self):
-        assert p._TEXTSC_RE.sub(r"\\text", r"\textsc{Hello}") == r"\text{Hello}"
+    def test_replaces_textsc_command_token(self, tmp_path):
+        content = r"\textsc{Hello}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_textsc(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == r"\text{Hello}"
 
-    def test_preserves_text(self):
-        assert p._TEXTSC_RE.sub(r"\\text", r"\text{ok}") == r"\text{ok}"
+    def test_preserves_text(self, tmp_path):
+        content = r"\text{ok}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        outcome = p.plan_normalize_textsc(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == content
 
-    def test_in_math(self):
+    def test_in_math(self, tmp_path):
         src = r"$\textsc{Foo}(x)$"
-        assert p._TEXTSC_RE.sub(r"\\text", src) == r"$\text{Foo}(x)$"
+        source = p.SourceFile(tmp_path / "main.tex", src)
+        outcome = p.plan_normalize_textsc(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == r"$\text{Foo}(x)$"
 
-    def test_no_match(self):
+    def test_no_match(self, tmp_path):
         src = "no textsc here"
-        assert p._TEXTSC_RE.sub(r"\\text", src) == src
+        source = p.SourceFile(tmp_path / "main.tex", src)
+        outcome = p.plan_normalize_textsc(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == src
+
+    def test_incomplete_textsc_is_preserved(self, tmp_path):
+        src = r"before \textsc{unfinished"
+        source = p.SourceFile(tmp_path / "main.tex", src)
+        outcome = p.plan_normalize_textsc(source, p.LatexDocument(source))
+        assert p.EditPlanner.apply(source, outcome.edits) == src
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_is_idempotent(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", r"\textsc{Word}")
+        first = p.EditPlanner.apply(
+            source,
+            p.plan_normalize_textsc(source, p.LatexDocument(source)).edits,
+        )
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_normalize_textsc(rewritten, p.LatexDocument(rewritten))
+
+        assert p.EditPlanner.apply(rewritten, second.edits) == first
 
 
-class TestProcessAlgorithms:
-    def test_full_algorithm(self):
-        tex = (
-            r"\begin{algorithm}" + "\n"
-            r"\caption{Test}" + "\n"
-            r"\begin{algorithmic}[1]" + "\n"
-            r"\Require input" + "\n"
-            r"\Return output" + "\n"
-            r"\end{algorithmic}" + "\n"
+class TestPlanAlgorithms:
+    @staticmethod
+    def apply_single(tmp_path, content):
+        main = tmp_path / "main.tex"
+        main.write_text(content)
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+        outcome = p.plan_algorithms(snapshot)
+        return (
+            p.EditPlanner.apply(snapshot.sources[main], outcome.edits),
+            outcome,
+        )
+
+    def test_preserves_nested_command_arguments(self, tmp_path):
+        content = (
+            r"\begin{algorithm}"
+            r"\caption{Nested \textbf{caption}}"
+            r"\label{alg:nested}"
+            r"\begin{algorithmic}"
+            r"\If{\Call{Ready}{\textbf{x_{i}}}}"
+            r"\State \Call{Update}{{x_{i}}, {y_j}}"
+            r"\EndIf"
+            r"\end{algorithmic}"
             r"\end{algorithm}"
         )
-        result = p.process_algorithms(tex)
-        assert "algorithmdisplay" in result
-        assert "Algorithm" in result
-        assert "Require" in result
 
-    def test_no_algorithm(self):
-        text = "just text"
-        assert p.process_algorithms(text) == text
+        result, _ = self.apply_single(tmp_path, content)
+
+        assert r"\textbf{Algorithm 1} Nested \textbf{caption}" in result
+        assert r"\operatorname{Ready}(\textbf{x_{i}})" in result
+        assert r"\operatorname{Update}({x_{i}}, {y_j})" in result
+        assert r"\hypertarget{alg:nested}" in result
+
+    def test_numbers_in_snapshot_document_order_without_global_state(self, tmp_path):
+        main = tmp_path / "main.tex"
+        part = tmp_path / "part.tex"
+        main.write_text(
+            r"\documentclass{article}\input{part}"
+            r"\begin{algorithm}\caption{First}"
+            r"\begin{algorithmic}\State a\end{algorithmic}"
+            r"\end{algorithm}"
+        )
+        part.write_text(
+            r"\begin{algorithm}\caption{Second}"
+            r"\begin{algorithmic}\State b\end{algorithmic}"
+            r"\end{algorithm}"
+        )
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        first = p.plan_algorithms(snapshot)
+        second = p.plan_algorithms(snapshot)
+        main_result = p.EditPlanner.apply(
+            snapshot.sources[main], [e for e in first.edits if e.file == main],
+        )
+        part_result = p.EditPlanner.apply(
+            snapshot.sources[part], [e for e in first.edits if e.file == part],
+        )
+
+        assert r"\textbf{Algorithm 1} First" in main_result
+        assert r"\textbf{Algorithm 2} Second" in part_result
+        assert first == second
+
+    def test_preserves_incomplete_algorithm_with_diagnostic(self, tmp_path):
+        content = (
+            r"before\begin{algorithm}\begin{algorithmic}"
+            r"\If{unfinished\end{algorithmic}\end{algorithm}after"
+        )
+
+        result, outcome = self.apply_single(tmp_path, content)
+
+        assert result == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_is_idempotent(self, tmp_path):
+        content = (
+            r"\begin{algorithm}\caption{Once}"
+            r"\begin{algorithmic}\State value\end{algorithmic}"
+            r"\end{algorithm}"
+        )
+        first, _ = self.apply_single(tmp_path, content)
+        rewritten = tmp_path / "rewritten"
+        rewritten.mkdir()
+        main = rewritten / "main.tex"
+        main.write_text(first)
+        snapshot = p.DocumentSnapshot.from_directory(rewritten, main)
+
+        outcome = p.plan_algorithms(snapshot)
+
+        assert outcome.edits == ()
+        assert p.EditPlanner.apply(snapshot.sources[main], outcome.edits) == first
+
+    def test_crlf_renderer_preserves_newlines_and_is_idempotent(self, tmp_path):
+        content = (
+            r"\begin{algorithm}" + "\r\n"
+            r"\caption{Test}" + "\r\n"
+            r"\begin{algorithmic}\State value\end{algorithmic}" + "\r\n"
+            r"\end{algorithm}"
+        )
+        first, _ = self.apply_single(tmp_path, content)
+        rewritten = tmp_path / "crlf"
+        rewritten.mkdir()
+        main = rewritten / "main.tex"
+        main.write_bytes(first.encode())
+        snapshot = p.DocumentSnapshot.from_directory(rewritten, main)
+
+        second = p.plan_algorithms(snapshot)
+
+        assert b"\n" not in first.encode().replace(b"\r\n", b"")
+        assert second.edits == ()
+
+    @pytest.mark.parametrize(
+        ("child_name", "mutation"),
+        [
+            ("caption", "opaque-ref"),
+            ("label", "foreign-ref"),
+            ("State", "opaque-ref"),
+            ("If", "opaque-argument"),
+        ],
+        ids=("caption", "label", "command", "required-argument"),
+    )
+    def test_preserves_algorithm_when_child_is_untrusted(
+        self, tmp_path, child_name, mutation,
+    ):
+        content = (
+            r"\begin{algorithm}\caption{Trusted}\label{alg:trusted}"
+            r"\begin{algorithmic}\If{condition}\State value\EndIf"
+            r"\end{algorithmic}\end{algorithm}"
+        )
+        main = tmp_path / "main.tex"
+        main.write_text(content)
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+        document = snapshot.documents[main]
+        changed = False
+        refs = []
+        for ref in document._refs:
+            if not changed and ref.name == child_name:
+                if mutation == "opaque-argument":
+                    argument = document.argument(ref, 0)
+                    assert argument is not None
+                    arguments = list(ref.arguments)
+                    arguments[0] = p.replace(
+                        argument, complete=False, opaque=True,
+                    )
+                    ref = p.replace(ref, arguments=tuple(arguments))
+                elif mutation == "foreign-ref":
+                    ref = p.replace(ref, file=tmp_path / "foreign.tex")
+                else:
+                    ref = p.replace(ref, complete=False, opaque=True)
+                changed = True
+            refs.append(ref)
+        assert changed
+        document._refs = tuple(refs)
+
+        outcome = p.plan_algorithms(snapshot)
+
+        assert p.EditPlanner.apply(snapshot.sources[main], outcome.edits) == content
+        expected_code = (
+            "foreign-reference" if mutation == "foreign-ref"
+            else "opaque-structure"
+        )
+        assert any(d.code == expected_code for d in outcome.diagnostics)
+
+    @pytest.mark.parametrize(
+        ("call_index", "mutation"),
+        [
+            (0, "opaque-ref"),
+            (0, "first-argument"),
+            (1, "foreign-ref"),
+            (1, "second-argument"),
+        ],
+        ids=("caption-ref", "caption-arg", "body-ref", "body-second-arg"),
+    )
+    def test_preserves_algorithm_when_call_is_untrusted(
+        self, tmp_path, call_index, mutation,
+    ):
+        content = (
+            r"\begin{algorithm}\caption{Run \Call{Name}{x}}"
+            r"\begin{algorithmic}\State \Call{Body}{y}\end{algorithmic}"
+            r"\end{algorithm}"
+        )
+        main = tmp_path / "main.tex"
+        main.write_text(content)
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+        document = snapshot.documents[main]
+        calls = document.commands("Call")
+        target = calls[call_index]
+        if mutation == "opaque-ref":
+            replacement = p.replace(target, complete=False, opaque=True)
+        elif mutation == "foreign-ref":
+            replacement = p.replace(target, file=tmp_path / "foreign.tex")
+        else:
+            argument_index = 0 if mutation == "first-argument" else 1
+            argument = document.argument(target, argument_index)
+            assert argument is not None
+            arguments = list(target.arguments)
+            arguments[argument_index] = p.replace(
+                argument, complete=False, opaque=True,
+            )
+            replacement = p.replace(target, arguments=tuple(arguments))
+        document._refs = tuple(
+            replacement if ref is target else ref for ref in document._refs
+        )
+
+        outcome = p.plan_algorithms(snapshot)
+
+        assert p.EditPlanner.apply(snapshot.sources[main], outcome.edits) == content
+        expected_code = (
+            "foreign-reference" if mutation == "foreign-ref"
+            else "opaque-structure"
+        )
+        assert any(d.code == expected_code for d in outcome.diagnostics)
+
+    def test_preserves_algorithm_with_incomplete_call(self, tmp_path):
+        content = (
+            r"\begin{algorithm}\caption{Bad \Call{Name}}"
+            r"\begin{algorithmic}\State value\end{algorithmic}"
+            r"\end{algorithm}"
+        )
+
+        result, outcome = self.apply_single(tmp_path, content)
+
+        assert result == content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
 
 
 # ── _transform_tex_files helper ─────────────────────────────────────────────
-
-
-class TestTransformTexFiles:
-    def test_transforms_file(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text("hello world")
-        p._transform_tex_files(
-            tmp_path, lambda c: c.replace("hello", "goodbye"), "Test",
-        )
-        assert tex.read_text() == "goodbye world"
-
-    def test_no_change_no_write(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text("unchanged")
-        mtime_before = tex.stat().st_mtime
-        p._transform_tex_files(tmp_path, lambda c: c, "Test")
-        # file should not be rewritten
-        assert tex.stat().st_mtime == mtime_before
-
-    def test_guard_skips(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text("no match here")
-        p._transform_tex_files(
-            tmp_path, lambda c: "CHANGED", "Test", guard="TRIGGER",
-        )
-        assert tex.read_text() == "no match here"
-
-    def test_guard_passes(self, tmp_path):
-        tex = tmp_path / "test.tex"
-        tex.write_text("has TRIGGER word")
-        p._transform_tex_files(
-            tmp_path, lambda c: c.replace("TRIGGER", "DONE"), "Test", guard="TRIGGER",
-        )
-        assert "DONE" in tex.read_text()
-
-    def test_glob_filter(self, tmp_path):
-        (tmp_path / "a.tex").write_text("change me")
-        sub = tmp_path / "sub"
-        sub.mkdir()
-        (sub / "b.tex").write_text("change me")
-        p._transform_tex_files(
-            tmp_path, lambda c: c.replace("change", "done"), "Test", glob="*.tex",
-        )
-        assert (tmp_path / "a.tex").read_text() == "done me"
-        assert (sub / "b.tex").read_text() == "change me"  # not matched by *.tex
-
-
-# ── find_main_tex ───────────────────────────────────────────────────────────
 
 
 class TestFindMainTex:
@@ -1296,29 +3825,24 @@ class TestFindMainTex:
         tex.write_text("no documentclass here")
         assert p.find_main_tex(tmp_path) == tex
 
+    def test_ignores_commented_document_markers(self, tmp_path):
+        commented = tmp_path / "commented.tex"
+        main = tmp_path / "main.tex"
+        commented.write_text("% \\documentclass{article}\n")
+        main.write_text(r"\begin{document}body\end{document}")
+
+        assert p.find_main_tex(tmp_path) == main
+
+    def test_ignores_incomplete_documentclass(self, tmp_path):
+        incomplete = tmp_path / "incomplete.tex"
+        main = tmp_path / "main.tex"
+        incomplete.write_text(r"\documentclass{article")
+        main.write_text(r"\documentclass{book}")
+
+        assert p.find_main_tex(tmp_path) == main
+
 
 # ── simplify_documentclass ──────────────────────────────────────────────────
-
-
-class TestSimplifyDocumentclass:
-    def test_replaces_complex_class(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\documentclass[12pt,twocolumn]{IEEEtran}")
-        p.simplify_documentclass(tex)
-        assert tex.read_text() == r"\documentclass{article}"
-
-    def test_strips_maketitle(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text("\\documentclass{article}\n\\maketitle\n")
-        p.simplify_documentclass(tex)
-        assert "maketitle" not in tex.read_text()
-
-    def test_already_simple(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        original = r"\documentclass{article}"
-        tex.write_text(original)
-        p.simplify_documentclass(tex)
-        assert tex.read_text() == original
 
 
 class TestPlanSimplifyDocumentclass:
@@ -1342,7 +3866,7 @@ class TestPlanSimplifyDocumentclass:
             "Body\n"
             "\\end{document}"
         )
-        assert all(edit.safety is p.Safety.SAFE for edit in edits)
+        assert all(edit.safety is p.Safety.LOSSY for edit in edits)
 
     def test_plan_is_idempotent(self, tmp_path):
         source = p.SourceFile(
@@ -1359,16 +3883,6 @@ class TestPlanSimplifyDocumentclass:
             second_source,
             p.LatexDocument(second_source),
         ) == []
-
-    def test_file_wrapper_tolerates_invalid_utf8(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_bytes(
-            b"\\documentclass{IEEEtran}\n% " + bytes([0xFF]) + b"\n"
-        )
-
-        p.simplify_documentclass(tex)
-
-        assert tex.read_text() == "\\documentclass{article}\n% \ufffd\n"
 
     @pytest.mark.parametrize(
         "content",
@@ -1419,7 +3933,7 @@ class TestPlanUnnumberParagraphs:
         assert edits[0].start == len(r"\paragraph")
         assert edits[0].start == edits[0].end
         assert edits[0].replacement == "*"
-        assert edits[0].safety is p.Safety.SAFE
+        assert edits[0].safety is p.Safety.LOSSY
         assert (
             p.EditPlanner.apply(source, edits)
             == r"\paragraph*{Contributions.} Body"
@@ -1457,37 +3971,7 @@ class TestPlanUnnumberParagraphs:
         assert second_edits == []
 
 
-class TestUnnumberParagraphHeadings:
-    def test_processes_nested_tex_files(self, tmp_path):
-        nested = tmp_path / "sections"
-        nested.mkdir()
-        tex = nested / "intro.tex"
-        tex.write_text(r"\paragraph{Contributions.} Body")
-
-        p.unnumber_paragraph_headings(tmp_path)
-
-        assert tex.read_text() == r"\paragraph*{Contributions.} Body"
-
-    def test_preserves_crlf_line_endings(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_bytes(b"before\r\n\\paragraph{Title}\r\nafter\r\n")
-
-        p.unnumber_paragraph_headings(tmp_path)
-
-        assert tex.read_bytes() == b"before\r\n\\paragraph*{Title}\r\nafter\r\n"
-
-
 class TestParagraphUnnumberingPipeline:
-    def test_runs_after_translation_and_before_input_normalization(self):
-        source = Path(p.__file__).read_text()
-        main_source = source[source.index("def main():") :]
-
-        assert (
-            main_source.index("translate_tex_files(")
-            < main_source.index("unnumber_paragraph_headings(")
-            < main_source.index("normalize_input_extensions(")
-        )
-
     @pytest.mark.skipif(shutil.which("pandoc") is None, reason="pandoc not installed")
     def test_pandoc_numbers_section_but_not_paragraph(self, tmp_path):
         content = r"\section{Numbered}" + "\n" + r"\paragraph{Unnumbered}" + "\nBody"
@@ -1512,393 +3996,402 @@ class TestParagraphUnnumberingPipeline:
 # ── get_input_order ─────────────────────────────────────────────────────────
 
 
-class TestGetInputOrder:
-    def test_single_file(self, tmp_path):
-        main = tmp_path / "main.tex"
-        main.write_text("just content")
-        result = p.get_input_order(main)
-        assert result == [main]
-
-    def test_follows_input(self, tmp_path):
-        (tmp_path / "chap.tex").write_text("chapter content")
-        main = tmp_path / "main.tex"
-        main.write_text(r"\input{chap}")
-        result = p.get_input_order(main)
-        assert len(result) == 2
-        assert result[0] == main
-        assert result[1].name == "chap.tex"
-
-    def test_follows_include(self, tmp_path):
-        (tmp_path / "appendix.tex").write_text("appendix content")
-        main = tmp_path / "main.tex"
-        main.write_text(r"\include{appendix}")
-        result = p.get_input_order(main)
-        assert len(result) == 2
-
-    def test_no_duplicates(self, tmp_path):
-        (tmp_path / "shared.tex").write_text("shared")
-        main = tmp_path / "main.tex"
-        main.write_text(r"\input{shared}\input{shared}")
-        result = p.get_input_order(main)
-        assert len(result) == 2  # main + shared, no dup
-
-
-class TestNormalizeInputExtensionsContent:
-    def test_resolves_root_include(self, tmp_path):
-        main = tmp_path / "main.tex"
-        (tmp_path / "chapter.tex").write_text("chapter")
-
-        result = p._normalize_input_extensions_content(
-            r"\input{chapter}", main, tmp_path,
+class TestNormalizeInputsPlanner:
+    @staticmethod
+    def discovery(*paths):
+        return p.DiscoveryFacts(
+            title=None,
+            authors=(),
+            abstract="",
+            macros=p.read_only_mapping({}),
+            packages=(),
+            include_order=tuple(paths),
+            graphicspaths=(),
+            resource_refs=(),
+            labels=p.read_only_mapping({}),
+            theorem_labels=p.read_only_mapping({}),
         )
 
-        assert result == r"\input{chapter.tex}"
-
-    def test_resolves_nested_sibling_before_document_root(self, tmp_path):
-        nested = tmp_path / "sections" / "intro.tex"
-        nested.parent.mkdir()
-        (nested.parent / "detail.tex").write_text("nested detail")
-
-        result = p._normalize_input_extensions_content(
-            r"\input{detail}", nested, tmp_path,
-        )
-
-        assert result == r"\input{detail.tex}"
-
-    def test_preserves_existing_extension(self, tmp_path):
-        content = r"\include{appendix.tex}"
-        assert p._normalize_input_extensions_content(
-            content, tmp_path / "main.tex", tmp_path,
-        ) == content
-
-    def test_preserves_missing_target(self, tmp_path):
-        content = r"\input{missing}"
-        assert p._normalize_input_extensions_content(
-            content, tmp_path / "main.tex", tmp_path,
-        ) == content
-
-    def test_is_idempotent(self, tmp_path):
+    def test_normalizes_only_targets_in_discovered_include_graph(self, tmp_path):
         main = tmp_path / "main.tex"
-        (tmp_path / "chapter.tex").write_text("chapter")
-        first = p._normalize_input_extensions_content(
-            r"\input{chapter}", main, tmp_path,
+        child = tmp_path / "sections" / "child.tex"
+        content = r"\input{sections/child} \include{missing}"
+        source = p.SourceFile(main, content)
+        outcome = p.plan_normalize_inputs(
+            source,
+            p.LatexDocument(source),
+            self.discovery(main, child),
         )
-        assert p._normalize_input_extensions_content(
-            first, main, tmp_path,
-        ) == first
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"\input{sections/child.tex} \include{missing}"
+        )
 
-    def test_file_wrapper_uses_each_referencing_path(self, tmp_path):
-        sections = tmp_path / "sections"
-        sections.mkdir()
-        intro = sections / "intro.tex"
-        intro.write_text(r"\input{detail}")
-        (sections / "detail.tex").write_text("detail")
+    def test_incomplete_input_is_preserved_with_diagnostic(self, tmp_path):
+        main = tmp_path / "main.tex"
+        source = p.SourceFile(main, r"\input{sections/child")
+        outcome = p.plan_normalize_inputs(
+            source,
+            p.LatexDocument(source),
+            self.discovery(main, tmp_path / "sections" / "child.tex"),
+        )
+        assert p.EditPlanner.apply(source, outcome.edits) == source.content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
 
-        p.normalize_input_extensions(tmp_path)
 
-        assert intro.read_text() == r"\input{detail.tex}"
+class TestPdfResources:
+    def test_failed_pdf_conversion_keeps_original_reference(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", r"\includegraphics{fig.pdf}")
+        resources = p.ResourceResult(converted=frozenset(), diagnostics=())
+        outcome = p.plan_rewrite_pdf_refs(
+            source, p.LatexDocument(source), resources,
+        )
+        assert outcome.edits == ()
+
+    def test_successful_pdf_conversion_rewrites_backed_reference(self, tmp_path):
+        pdf = tmp_path / "fig.pdf"
+        source = p.SourceFile(tmp_path / "main.tex", r"\includegraphics{fig.pdf}")
+        resources = p.ResourceResult(converted=frozenset({pdf}), diagnostics=())
+        outcome = p.plan_rewrite_pdf_refs(
+            source, p.LatexDocument(source), resources,
+        )
+        assert p.EditPlanner.apply(source, outcome.edits) == (
+            r"\includegraphics{fig.png}"
+        )
+
+    def test_incomplete_image_reference_is_preserved_with_diagnostic(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", r"\includegraphics{fig.pdf")
+        resources = p.ResourceResult(
+            converted=frozenset({tmp_path / "fig.pdf"}), diagnostics=(),
+        )
+        outcome = p.plan_rewrite_pdf_refs(
+            source, p.LatexDocument(source), resources,
+        )
+        assert p.EditPlanner.apply(source, outcome.edits) == source.content
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_pdf_refs_apply_reparse_replan_is_idempotent(self, tmp_path):
+        source = p.SourceFile(tmp_path / "main.tex", r"\includegraphics{fig.pdf}")
+        resources = p.ResourceResult(
+            converted=frozenset({tmp_path / "fig.pdf"}), diagnostics=(),
+        )
+        first_outcome = p.plan_rewrite_pdf_refs(
+            source, p.LatexDocument(source), resources,
+        )
+        first = p.EditPlanner.apply(source, first_outcome.edits)
+        assert first == r"\includegraphics{fig.png}"
+        rewritten = p.SourceFile(source.path, first)
+        second = p.plan_rewrite_pdf_refs(
+            rewritten, p.LatexDocument(rewritten), resources,
+        )
+        assert second.edits == ()
+
+    def test_conversion_records_only_resources_saved_successfully(
+        self, tmp_path, monkeypatch,
+    ):
+        good = tmp_path / "good.pdf"
+        bad = tmp_path / "bad.pdf"
+        good.write_bytes(b"good")
+        bad.write_bytes(b"bad")
+
+        class FakeImage:
+            def __init__(self, fail):
+                self.fail = fail
+
+            def save(self, path):
+                if self.fail:
+                    raise OSError("save failed")
+                Path(path).write_bytes(b"png")
+
+        class FakePage:
+            def __init__(self, fail):
+                self.fail = fail
+
+            def render(self, scale):
+                assert scale == 4
+                return type("Bitmap", (), {"to_pil": lambda _self: FakeImage(self.fail)})()
+
+        class FakeDocument:
+            def __init__(self, path):
+                self.fail = Path(path).name == "bad.pdf"
+
+            def __getitem__(self, index):
+                assert index == 0
+                return FakePage(self.fail)
+
+        fake_pdfium = type("Pdfium", (), {"PdfDocument": FakeDocument})()
+        monkeypatch.setitem(sys.modules, "pypdfium2", fake_pdfium)
+
+        result = p.convert_pdf_resources(tmp_path)
+
+        assert result.converted == frozenset({good})
+        assert (tmp_path / "good.png").exists()
+        assert not (tmp_path / "bad.png").exists()
+        assert [d.code for d in result.diagnostics] == ["pdf-conversion-failed"]
+
+
+class TestReferencePassDependencies:
+    def test_reference_passes_declare_barrier_and_post_translation_order(self):
+        specs = p.build_reference_passes(p.ResourceResult(frozenset(), ()))
+        by_name = {spec.name: spec for spec in specs}
+        assert "convert_pdf_resources" in by_name["rewrite_pdf_image_refs"].after
+        assert "discover" in by_name["normalize_input_extensions"].after
+        assert "translate" in by_name["normalize_input_extensions"].after
+        assert all(spec.idempotent for spec in specs)
 
 
 # ── extract_abstract ────────────────────────────────────────────────────────
 
 
-class TestExtractAbstract:
-    def test_basic(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\begin{abstract}This is abstract.\end{abstract}")
-        assert p.extract_abstract(tex) == "This is abstract."
+class TestPlanTheorems:
+    @staticmethod
+    def _snapshot(tmp_path, content):
+        main = tmp_path / "main.tex"
+        main.write_text(content)
+        snapshot = p.DocumentSnapshot.from_directory(tmp_path, main)
+        discovered = p.build_discovery_facts(snapshot)
+        return discovered, discovered.discovery
 
-    def test_no_abstract(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\begin{document}\end{document}")
-        assert p.extract_abstract(tex) == ""
-
-
-# ── Theorem preprocessing (integration) ────────────────────────────────────
-
-
-class TestPreprocessTheorems:
-    def test_basic_theorem(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{theorem}Some statement.\end{theorem}")
-        p.preprocess_theorems(tmp_path)
-        result = tex.read_text()
-        assert r"\begin{quote}" in result
-        assert "Theorem 1" in result
-        assert "Some statement." in result
-
-    def test_theorem_with_name(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{theorem}[Fermat] Statement.\end{theorem}")
-        p.preprocess_theorems(tmp_path)
-        result = tex.read_text()
-        assert "Fermat" in result
-
-    def test_proof(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{proof}By induction.\end{proof}")
-        p.preprocess_theorems(tmp_path)
-        result = tex.read_text()
-        assert "Proof." in result
-        assert "square" in result
-
-    def test_custom_newtheorem(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(
-            r"\newtheorem{mydef}{My Definition}" + "\n"
-            r"\begin{mydef}Custom env.\end{mydef}"
+    def test_theorem_body_may_contain_nested_environments(self, tmp_path):
+        snapshot, facts = self._snapshot(
+            tmp_path,
+            r"\newtheorem{claim}{Claim}"
+            r"\begin{claim}[Nested]"
+            r"\begin{enumerate}\item See \cite{a}.\end{enumerate}"
+            r"\end{claim}",
         )
-        p.preprocess_theorems(tmp_path)
-        result = tex.read_text()
-        assert "My Definition 1" in result
+
+        outcome = p.plan_theorems(snapshot, facts)
+        source = snapshot.sources[snapshot.main_tex]
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert r"\begin{enumerate}" in result
+        assert r"\textbf{Claim 1}" in result
+        assert r"\textit{(Nested)}" in result
+
+    def test_numbers_in_snapshot_include_order(self, tmp_path):
+        main = tmp_path / "main.tex"
+        child = tmp_path / "child.tex"
+        main.write_text(
+            r"\newtheorem{claim}{Claim}"
+            r"\begin{claim}First.\end{claim}"
+            r"\input{child}"
+        )
+        child.write_text(r"\begin{claim}Second.\end{claim}")
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+
+        outcome = p.plan_theorems(snapshot, snapshot.discovery)
+        by_file = {}
+        for edit in outcome.edits:
+            by_file.setdefault(edit.file, []).append(edit)
+
+        main_result = p.EditPlanner.apply(snapshot.sources[main], by_file[main])
+        child_result = p.EditPlanner.apply(snapshot.sources[child], by_file[child])
+        assert "Claim 1" in main_result
+        assert "Claim 2" in child_result
+
+    def test_optional_proof_heading_and_nested_body(self, tmp_path):
+        snapshot, facts = self._snapshot(
+            tmp_path,
+            r"\begin{proof}[Proof of the {main} result]"
+            r"\begin{enumerate}\item Done.\end{enumerate}"
+            r"\end{proof}",
+        )
+
+        outcome = p.plan_theorems(snapshot, facts)
+        source = snapshot.sources[snapshot.main_tex]
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert r"\textit{Proof of the {main} result.}" in result
+        assert r"\begin{enumerate}" in result
+        assert r"\hfill$\square$" in result
+
+    def test_preserves_incomplete_custom_theorem_with_diagnostic(self, tmp_path):
+        snapshot, facts = self._snapshot(
+            tmp_path,
+            r"\newtheorem{claim}{Claim}\begin{claim}unfinished",
+        )
+
+        outcome = p.plan_theorems(snapshot, facts)
+
+        assert outcome.edits == ()
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_is_idempotent(self, tmp_path):
+        snapshot, facts = self._snapshot(
+            tmp_path,
+            r"\begin{theorem}Statement.\end{theorem}",
+        )
+        first = p.plan_theorems(snapshot, facts)
+        source = snapshot.sources[snapshot.main_tex]
+        rewritten = p.EditPlanner.apply(source, first.edits)
+        source.path.write_text(rewritten)
+        second_snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, source.path)
+        )
+
+        second = p.plan_theorems(second_snapshot, second_snapshot.discovery)
+
+        assert second.edits == ()
+
+    def test_crlf_renderer_preserves_newlines_and_is_idempotent(self, tmp_path):
+        snapshot, facts = self._snapshot(
+            tmp_path,
+            r"\begin{theorem}" + "\r\nStatement.\r\n" + r"\end{theorem}",
+        )
+        source = snapshot.sources[snapshot.main_tex]
+        first = p.EditPlanner.apply(
+            source, p.plan_theorems(snapshot, facts).edits,
+        )
+        source.path.write_bytes(first.encode())
+        second_snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, source.path)
+        )
+
+        second = p.plan_theorems(
+            second_snapshot, second_snapshot.discovery,
+        )
+
+        assert b"\n" not in first.encode().replace(b"\r\n", b"")
+        assert second.edits == ()
+
+    def test_nested_target_is_preserved_and_does_not_consume_number(self, tmp_path):
+        content = (
+            r"\begin{theorem}Outer "
+            r"\begin{theorem}Nested literal.\end{theorem}"
+            r"\end{theorem}"
+            r"\begin{theorem}Sibling.\end{theorem}"
+        )
+        snapshot, facts = self._snapshot(tmp_path, content)
+
+        first_outcome = p.plan_theorems(snapshot, facts)
+        source = snapshot.sources[snapshot.main_tex]
+        first = p.EditPlanner.apply(source, first_outcome.edits)
+
+        assert r"\textbf{Theorem 1}" in first
+        assert r"\begin{theorem}Nested literal.\end{theorem}" in first
+        assert r"\textbf{Theorem 2}" in first
+        assert "Theorem 3" not in first
+
+        source.path.write_text(first)
+        second_snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, source.path)
+        )
+        second_outcome = p.plan_theorems(
+            second_snapshot, second_snapshot.discovery,
+        )
+
+        assert second_outcome.edits == ()
+
+    def test_user_quote_theorem_is_converted(self, tmp_path):
+        snapshot, facts = self._snapshot(
+            tmp_path,
+            r"\begin{quote}\begin{theorem}User theorem.\end{theorem}"
+            r"\end{quote}",
+        )
+
+        outcome = p.plan_theorems(snapshot, facts)
+        source = snapshot.sources[snapshot.main_tex]
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert r"\textbf{Theorem 1}" in result
+        assert "paper2epub:generated-theorem" in result
+
+    def test_generated_quote_skips_nested_target_through_intermediate_env(
+        self, tmp_path,
+    ):
+        content = (
+            r"\begin{theorem}Outer "
+            r"\begin{center}\begin{theorem}Nested.\end{theorem}\end{center}"
+            r"\end{theorem}"
+        )
+        snapshot, facts = self._snapshot(tmp_path, content)
+        source = snapshot.sources[snapshot.main_tex]
+        first = p.EditPlanner.apply(
+            source, p.plan_theorems(snapshot, facts).edits,
+        )
+        source.path.write_text(first)
+        second_snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, source.path)
+        )
+
+        second = p.plan_theorems(
+            second_snapshot, second_snapshot.discovery,
+        )
+
+        assert "paper2epub:generated-theorem" in first
+        assert second.edits == ()
+
+
+class TestPlanCodeListings:
+    def test_minted_nested_options_and_language_preserve_body(self, tmp_path):
+        content = (
+            r"\begin{minted}[escapeinside={{(*@}{@*)}}]{python{3}}"
+            r"print({\"key\": {1, 2}})"
+            r"\end{minted}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_code_listings(source, p.LatexDocument(source))
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert result == (
+            r"\begin{verbatim}print({\"key\": {1, 2}})\end{verbatim}"
+        )
+        body_offset = content.index("print")
+        assert all(
+            not (edit.start <= body_offset < edit.end)
+            for edit in outcome.edits
+        )
+
+    def test_mintinline_nested_arguments_becomes_texttt(self, tmp_path):
+        content = r"\mintinline[escapeinside={{{}{}}}]{python{3}}{x_{i} = {a: b}}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_code_listings(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == r"\texttt{x_{i} = {a: b}}"
+
+    def test_strips_lstlisting_options_with_nested_groups(self, tmp_path):
+        content = r"\begin{lstlisting}[language=C,caption={A {nested} title}]code\end{lstlisting}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_code_listings(source, p.LatexDocument(source))
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert result == r"\begin{lstlisting}code\end{lstlisting}"
+
+    def test_preserves_incomplete_minted_with_diagnostic(self, tmp_path):
+        content = r"\begin{minted}[linenos]{python}unfinished"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_code_listings(source, p.LatexDocument(source))
+
+        assert outcome.edits == ()
+        assert any(d.code == "opaque-structure" for d in outcome.diagnostics)
+
+    def test_is_idempotent(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\begin{minted}{python}code\end{minted}",
+        )
+        first = p.EditPlanner.apply(
+            source, p.plan_code_listings(source, p.LatexDocument(source)).edits,
+        )
+        rewritten = p.SourceFile(source.path, first)
+
+        second = p.plan_code_listings(rewritten, p.LatexDocument(rewritten))
+
+        assert second.edits == ()
 
 
 # ── End-to-end preprocessing (file-level) ──────────────────────────────────
 
 
-class TestFilePreprocessing:
-    def test_normalize_citations(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\citep{ref1} and \textcite{ref2}")
-        p.normalize_citations(tmp_path)
-        result = tex.read_text()
-        assert r"\cite{ref1}" in result
-        assert r"\cite{ref2}" in result
+class TestEpubCss:
+    def test_pre_rule_explicitly_left_aligns_block_code(self):
+        css = (Path(p.__file__).resolve().parent / "epub.css").read_text()
+        pre_rule = css.split("\npre {\n", 1)[1].split("\n}", 1)[0]
 
-    def test_preprocess_hyperref(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\hyperref[sec]{Section} text")
-        p.preprocess_hyperref(tmp_path)
-        assert tex.read_text() == "Section text"
-
-    def test_strip_resizebox(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\resizebox{\textwidth}{!}{TABLE}")
-        p.strip_resizebox(tmp_path)
-        assert tex.read_text() == "TABLE"
-
-    def test_strip_adjustbox(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\adjustbox{width=5cm}{content here}")
-        p.strip_adjustbox(tmp_path)
-        assert tex.read_text() == "content here"
-
-    def test_destar_floats(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{figure*}img\end{figure*}")
-        p.destar_floats(tmp_path)
-        result = tex.read_text()
-        assert r"\begin{figure}" in result
-        assert r"\end{figure}" in result
-
-    def test_replace_ding(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\ding{51}")
-        p.replace_ding_commands(tmp_path)
-        assert tex.read_text() == "✓"
-
-    def test_replace_textcircled_math(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"step $\textcircled{1}$ and $\textcircled{2}$")
-        p.replace_textcircled(tmp_path)
-        assert tex.read_text() == "step ① and ②"
-
-    def test_replace_textcircled_bare(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\textcircled{3}")
-        p.replace_textcircled(tmp_path)
-        assert tex.read_text() == "③"
-
-    def test_normalize_table_envs(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{tabu}data\end{tabu}")
-        p.normalize_table_envs(tmp_path)
-        result = tex.read_text()
-        assert r"\begin{tabular}" in result
-        assert r"\end{tabular}" in result
-
-    def test_unwrap_makecell(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\makecell{Line 1 \\ Line 2}")
-        p.unwrap_makecell(tmp_path)
-        assert tex.read_text() == "Line 1 Line 2"
-
-    def test_unwrap_makecell_with_alignment(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\makecell[c]{A \\ B}")
-        p.unwrap_makecell(tmp_path)
-        assert tex.read_text() == "A B"
-
-    def test_strip_minipage_in_tables(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(
-            r"\begin{tabular}{cc}"
-            r"\begin{minipage}{2cm}\includegraphics{img}\end{minipage}"
-            r" & text \end{tabular}"
-        )
-        p.strip_minipage_in_tables(tmp_path)
-        result = tex.read_text()
-        assert r"\begin{minipage}" not in result
-        assert r"\includegraphics{img}" in result
-
-    def test_strip_at_col_specs_tabular(self):
-        content = r"\begin{tabular}{@{}p{0.3\columnwidth}p{0.3\columnwidth}@{}}"
-        result = p._strip_at_col_specs_content(content)
-        assert result == r"\begin{tabular}{p{0.3\columnwidth}p{0.3\columnwidth}}"
-
-    def test_strip_at_col_specs_multicolumn(self):
-        content = r"\multicolumn{3}{@{}l}{\textit{Group}}"
-        result = p._strip_at_col_specs_content(content)
-        assert result == r"\multicolumn{3}{l}{\textit{Group}}"
-
-    def test_strip_at_col_specs_no_change(self):
-        content = r"\begin{tabular}{lll}"
-        result = p._strip_at_col_specs_content(content)
-        assert result == content
-
-    def test_normalize_code_listings(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{minted}{python}code\end{minted}")
-        p.normalize_code_listings(tmp_path)
-        result = tex.read_text()
-        assert r"\begin{verbatim}" in result
-        assert r"\end{verbatim}" in result
-
-    def test_convert_wrapfigure(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{wrapfigure}{r}{0.5\textwidth}img\end{wrapfigure}")
-        p.convert_wrapfigure(tmp_path)
-        result = tex.read_text()
-        assert r"\begin{figure}[H]" in result
-        assert r"\end{figure}" in result
-
-    def test_unwrap_subfigures(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\begin{subfigure}[b]{0.5\textwidth}img\end{subfigure}")
-        p.unwrap_subfigures(tmp_path)
-        result = tex.read_text()
-        assert "subfigure" not in result
-        assert "img" in result
-
-    def test_strip_problematic_packages(self, tmp_path):
-        tex = tmp_path / "paper.tex"
-        tex.write_text(r"\usepackage{hyperref}" + "\n" + r"\usepackage{amsmath}")
-        p.strip_problematic_packages(tmp_path)
-        result = tex.read_text()
-        assert "hyperref" not in result
-        assert "amsmath" in result
-
-
-class TestUnwrapMakecell:
-    def test_basic(self):
-        assert p._unwrap_makecell_content(r"\makecell{A \\ B}") == "A B"
-
-    def test_with_alignment(self):
-        assert p._unwrap_makecell_content(r"\makecell[c]{A \\ B}") == "A B"
-
-    def test_star(self):
-        assert p._unwrap_makecell_content(r"\makecell*{X \\ Y}") == "X Y"
-
-    def test_nested_formatting(self):
-        result = p._unwrap_makecell_content(r"\makecell{\textbf{Bold} \\ normal}")
-        assert result == r"\textbf{Bold} normal"
-
-    def test_three_lines(self):
-        result = p._unwrap_makecell_content(r"\makecell{A \\ B \\ C}")
-        assert result == "A B C"
-
-    def test_backslash_with_optional_arg(self):
-        result = p._unwrap_makecell_content(r"\makecell{A \\[2pt] B}")
-        assert result == "A B"
-
-    def test_no_makecell(self):
-        text = r"plain text \\ more"
-        assert p._unwrap_makecell_content(text) == text
-
-    def test_preserves_surrounding(self):
-        result = p._unwrap_makecell_content(r"before \makecell{A \\ B} after")
-        assert result == "before A B after"
-
-
-class TestStripMinipageInTables:
-    def test_strips_inside_tabular(self):
-        content = (
-            r"\begin{tabular}{cc}"
-            r"{col} "
-            r"\begin{minipage}{2.5cm}"
-            r"\includegraphics[width=\linewidth]{img.png}"
-            r"\end{minipage}"
-            r" & text"
-            r"\end{tabular}"
-        )
-        result = p._strip_minipage_in_tables_content(content)
-        assert r"\begin{minipage}" not in result
-        assert r"\end{minipage}" not in result
-        assert r"\includegraphics[width=\linewidth]{img.png}" in result
-
-    def test_preserves_outside_tabular(self):
-        content = (
-            r"\begin{figure}"
-            r"\begin{minipage}{0.5\textwidth}img\end{minipage}"
-            r"\end{figure}"
-        )
-        result = p._strip_minipage_in_tables_content(content)
-        assert r"\begin{minipage}" in result
-
-    def test_minipage_with_optional_position(self):
-        content = (
-            r"\begin{tabular}{c}"
-            r"{l} "
-            r"\begin{minipage}[t]{2cm}content\end{minipage}"
-            r"\end{tabular}"
-        )
-        result = p._strip_minipage_in_tables_content(content)
-        assert r"\begin{minipage}" not in result
-        assert "content" in result
-
-
-class TestArxivCompatibilityHelpers:
-    def test_strip_tex_comments_preserves_escaped_percent(self):
-        assert p.strip_tex_comments(r"100\% ok % comment") == r"100\% ok "
-
-    def test_get_input_order_relative_to_nested_file(self, tmp_path):
-        sections = tmp_path / "sections"
-        sections.mkdir()
-        (sections / "intro.tex").write_text(r"\input{detail}")
-        (sections / "detail.tex").write_text("details")
-        main = tmp_path / "main.tex"
-        main.write_text(r"\input{sections/intro}")
-        result = p.get_input_order(main)
-        assert [path.name for path in result] == ["main.tex", "intro.tex", "detail.tex"]
-
-    def test_find_main_tex_searches_subdirectories(self, tmp_path):
-        src = tmp_path / "src"
-        src.mkdir()
-        main = src / "paper.tex"
-        main.write_text(r"\documentclass{article}")
-        assert p.find_main_tex(tmp_path) == main
-
-    def test_simplify_documentclass_without_options(self, tmp_path):
-        tex = tmp_path / "main.tex"
-        tex.write_text(r"\documentclass{IEEEtran}")
-        p.simplify_documentclass(tex)
-        assert tex.read_text() == r"\documentclass{article}"
-
-    def test_rewrite_pdf_image_refs_keeps_options(self):
-        content = r"\includegraphics[width=.8\linewidth]{figs/plot.pdf}"
-        result = p._rewrite_pdf_image_refs_content(content)
-        assert result == r"\includegraphics[width=.8\linewidth]{figs/plot.png}"
-
-    def test_graphicspath_dirs_parse_multiple_directories(self):
-        content = r"\graphicspath{{figures/}{images/generated/}}"
-        assert p._iter_graphicspath_dirs(content) == ["figures", "images/generated"]
-
-    def test_pandoc_resource_paths_include_graphicspath(self, tmp_path):
-        (tmp_path / "main.tex").write_text(r"\graphicspath{{assets/plots/}}")
-        assert "assets/plots" in p._pandoc_resource_paths(tmp_path)
-
-    def test_strip_problematic_packages_preserves_graphicspath(self):
-        content = r"\graphicspath{{figures/}}" + "\n" + r"\hypersetup{colorlinks=true}"
-        result = p._strip_problematic_packages_content(content)
-        assert r"\graphicspath{{figures/}}" in result
-        assert "hypersetup" not in result
+        assert "text-align: left;" in pre_rule

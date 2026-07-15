@@ -129,6 +129,12 @@ Pass `guard="\\commandname"` to `_transform_tex_files` to skip files that don't 
   `_normalize_input_extensions_content` resolves targets relative to the
   referencing `.tex` file first, then the paper root.
 
+## Repository Workflow
+
+- Never commit AI-generated design, specification, planning, or implementation-plan documents. Keep such artifacts outside the repository or leave them untracked for local use only.
+- Before merging any development branch into a trunk branch such as `main` or `master`, squash all branch commits into a single commit. Do not merge a multi-commit branch history directly into the trunk.
+- After repository changes are complete and verified, automatically create the squashed local commit, merge it into the local `main` branch, and verify the merged result. This is standing authorization for local commits and local merges; do not ask for confirmation each time.
+
 ## Key Details
 
 - Output is EPUB3 with MathML for equations, auto-generated TOC (`--toc`), and numbered sections
