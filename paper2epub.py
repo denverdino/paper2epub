@@ -24,15 +24,17 @@ import smtplib
 import socket
 import subprocess
 import sys
+import threading
 from urllib.parse import urlparse
 import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar
 
 from pylatexenc.latexwalker import (
     LatexCharsNode,
@@ -149,6 +151,7 @@ _PARSER_MACRO_ARGS = {
     "author": "{",
     "caption": "{",
     "captionsetup": "*[{",
+    "chapter": "*[{",
     "mintinline": "[{{",
     "ccsdesc": "[{",
     "captionof": "{{",
@@ -225,7 +228,7 @@ for _cite_alias in _CITE_ALIASES:
     _PARSER_MACRO_ARGS[_cite_alias] = "*[[{"
 
 _NON_PROSE_LITERAL_MACROS = {
-    "section", "subsection", "subsubsection", "paragraph",
+    "chapter", "section", "subsection", "subsubsection", "paragraph",
     "label", "caption", "includegraphics", "input", "include",
     "bibliography", "bibliographystyle", "documentclass", "usepackage",
     "RequirePackage", "title", "author", "date", "keywords",
@@ -251,6 +254,7 @@ _PARSER_ENVIRONMENT_ARGS = {
     "NiceTabular": "[{[",
     "NiceTabular*": "[{[{[",
     "subfigure": "[{",
+    "subequations": "",
     "tabular": "{",
     "tabular*": "{",
     "tabularx": "[{{",
@@ -263,12 +267,181 @@ _PARSER_ENVIRONMENT_ARGS = {
 }
 
 _PARSER_ARGUMENT_INDEXES = {
+    "chapter": (2,),
     "paragraph": (2,),
     "resizebox": (1, 2, 3),
     "section": (2,),
     "subsection": (2,),
     "subsubsection": (2,),
 }
+
+_DEFINITION_BODY_COUNTS = MappingProxyType({
+    "newcommand": 1,
+    "renewcommand": 1,
+    "providecommand": 1,
+    "DeclareRobustCommand": 1,
+    "newenvironment": 2,
+})
+_DEFINITION_COMMAND_RE = re.compile(
+    r"\\(newcommand|renewcommand|providecommand|DeclareRobustCommand|newenvironment)\*?"
+)
+_ENVIRONMENT_TOKEN_RE = re.compile(r"\\(?:begin|end)(?=\s|%|\{)")
+_DEFINITION_MASK_CHARACTER: Final[str] = "."
+
+
+def _is_escaped_character(content: str, pos: int) -> bool:
+    backslashes = 0
+    pos -= 1
+    while pos >= 0 and content[pos] == "\\":
+        backslashes += 1
+        pos -= 1
+    return backslashes % 2 == 1
+
+
+def strip_tex_comments(content: str) -> str:
+    characters: list[str] = []
+    pos = 0
+    while pos < len(content):
+        if content[pos] == "%" and not _is_escaped_character(content, pos):
+            while pos < len(content) and content[pos] not in "\r\n":
+                pos += 1
+            continue
+        characters.append(content[pos])
+        pos += 1
+    return "".join(characters)
+
+
+def _in_tex_comment(content: str, pos: int) -> bool:
+    line_start = max(
+        content.rfind("\n", 0, pos),
+        content.rfind("\r", 0, pos),
+    ) + 1
+    percent = content.find("%", line_start, pos)
+    while percent >= 0:
+        if not _is_escaped_character(content, percent):
+            return True
+        percent = content.find("%", percent + 1, pos)
+    return False
+
+
+def _iter_environment_token_ranges(
+    content: str,
+    start: int = 0,
+    end: int | None = None,
+) -> Iterable[tuple[int, int]]:
+    limit = len(content) if end is None else end
+    for match in _ENVIRONMENT_TOKEN_RE.finditer(content, start, limit):
+        token_start = match.start()
+        if (
+            _is_escaped_character(content, token_start)
+            or _in_tex_comment(content, token_start)
+        ):
+            continue
+
+        pos = match.end()
+        while pos < limit:
+            if content[pos].isspace():
+                pos += 1
+                continue
+            if content[pos] != "%" or _is_escaped_character(content, pos):
+                break
+            newline = re.search(r"\r\n|\r|\n", content[pos:limit])
+            if newline is None:
+                pos = limit
+                break
+            pos += newline.end()
+
+        if pos >= limit or content[pos] != "{":
+            continue
+        closing = content.find("}", pos + 1, limit)
+        if closing < 0:
+            continue
+        name = content[pos + 1:closing]
+        if not name or any(character in name for character in "{}\r\n"):
+            continue
+        yield token_start, closing + 1
+
+
+def _complete_group_range(content: str, pos: int) -> tuple[int, int] | None:
+    while pos < len(content) and content[pos].isspace():
+        pos += 1
+    if pos >= len(content) or content[pos] != "{":
+        return None
+    closing = find_matching_brace(content, pos)
+    return None if closing is None else (pos, closing + 1)
+
+
+def _definition_body_ranges(content: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    for match in _DEFINITION_COMMAND_RE.finditer(content):
+        if (
+            _is_escaped_character(content, match.start())
+            or _in_tex_comment(content, match.start())
+        ):
+            continue
+        definition_name = match.group(1)
+        pos = match.end()
+        name_group = _complete_group_range(content, pos)
+        if name_group is not None:
+            name_text = content[name_group[0] + 1:name_group[1] - 1]
+            if definition_name == "newenvironment":
+                if (
+                    not name_text.strip()
+                    or any(character in name_text for character in "{}\r\n")
+                ):
+                    continue
+            elif re.fullmatch(
+                r"\s*\\(?:[A-Za-z@]+|.)\s*", name_text
+            ) is None:
+                continue
+            pos = name_group[1]
+        else:
+            if definition_name == "newenvironment":
+                continue
+            while pos < len(content) and content[pos].isspace():
+                pos += 1
+            name = re.match(r"\\(?:[A-Za-z@]+|.)", content[pos:])
+            if name is None:
+                continue
+            pos += name.end()
+        valid = True
+        while True:
+            while pos < len(content) and content[pos].isspace():
+                pos += 1
+            if pos >= len(content) or content[pos] != "[":
+                break
+            closing = find_matching_bracket(content, pos)
+            if closing is None:
+                valid = False
+                break
+            pos = closing + 1
+        if not valid:
+            continue
+        bodies: list[tuple[int, int]] = []
+        for _ in range(_DEFINITION_BODY_COUNTS[definition_name]):
+            group = _complete_group_range(content, pos)
+            if group is None:
+                bodies = []
+                break
+            bodies.append((group[0] + 1, group[1] - 1))
+            pos = group[1]
+        ranges.extend(bodies)
+    return tuple(ranges)
+
+
+def _mask_definition_environment_tokens(content: str) -> str:
+    characters = list(content)
+    for start, end in _definition_body_ranges(content):
+        for token_start, token_end in _iter_environment_token_ranges(
+            content, start, end,
+        ):
+            characters[token_start:token_end] = [
+                character
+                if character in "\r\n"
+                else _DEFINITION_MASK_CHARACTER
+                for character in content[token_start:token_end]
+            ]
+    return "".join(characters)
 
 
 @cache
@@ -326,6 +499,17 @@ class LatexNodeRef:
     opaque: bool
 
 
+@dataclass(frozen=True)
+class LatexMathRef:
+    start: int
+    end: int
+    display: bool
+    opening_delimiter: str
+    closing_delimiter: str
+    complete: bool
+    opaque: bool
+
+
 def _public_argument(ref: LatexNodeRef, index: int) -> LatexArgumentRef | None:
     argument_indexes = _PARSER_ARGUMENT_INDEXES.get(ref.name)
     if argument_indexes is not None:
@@ -350,7 +534,9 @@ class LatexDocument:
         pending_diagnostics: list[Diagnostic] = []
         self._pending_diagnostics = pending_diagnostics
         try:
-            parser_content = source.content.replace(
+            parser_content = _mask_definition_environment_tokens(
+                source.content
+            ).replace(
                 r"\Hy@raisedlink", r"\HyZraisedlink",
             )
             walker = LatexWalker(
@@ -365,11 +551,64 @@ class LatexDocument:
         except LatexWalkerParseError as exc:
             nodes = []
             self.parse_warnings = (str(exc),)
+        self.math = tuple(self._walk_math(nodes))
+        self.comment_ranges = tuple(self._walk_comments(nodes))
         refs = tuple(self._walk(nodes, parent_environment=None))
         self._refs = self._propagate_opaque_ranges(refs)
         self.literal_alpha_count = self._count_literal_alpha(nodes)
         self.diagnostics = tuple(pending_diagnostics)
         del self._pending_diagnostics
+
+    def _walk_math(self, nodes: Iterable[Any]) -> Iterable[LatexMathRef]:
+        for node in nodes:
+            if isinstance(node, LatexMathNode):
+                opening, closing = node.delimiters
+                start = node.pos
+                end = node.pos + node.len
+                complete = (
+                    self.source.content.startswith(opening, start)
+                    and self.source.content.endswith(closing, start, end)
+                )
+                yield LatexMathRef(
+                    start=start,
+                    end=end,
+                    display=node.displaytype == "display",
+                    opening_delimiter=opening,
+                    closing_delimiter=closing,
+                    complete=complete,
+                    opaque=not complete,
+                )
+                continue
+
+            nodeargd = getattr(node, "nodeargd", None)
+            if nodeargd is not None:
+                for argument in nodeargd.argnlist:
+                    if argument is not None:
+                        yield from self._walk_math((argument,))
+
+            children = getattr(node, "nodelist", None)
+            if children:
+                yield from self._walk_math(children)
+
+    def _walk_comments(
+        self, nodes: Iterable[Any],
+    ) -> Iterable[tuple[int, int]]:
+        for node in nodes:
+            if isinstance(node, LatexCommentNode):
+                yield node.pos, node.pos + node.len
+                continue
+            if isinstance(node, LatexMathNode):
+                continue
+
+            nodeargd = getattr(node, "nodeargd", None)
+            if nodeargd is not None:
+                for argument in nodeargd.argnlist:
+                    if argument is not None:
+                        yield from self._walk_comments((argument,))
+
+            children = getattr(node, "nodelist", None)
+            if children:
+                yield from self._walk_comments(children)
 
     @classmethod
     def _count_literal_alpha(cls, nodes: Iterable[Any]) -> int:
@@ -1251,6 +1490,62 @@ def _macro_invocation_argspec(definition: MacroDefinition) -> str:
     return "[" + "{" * (definition.parameter_count - 1)
 
 
+_TITLE_DROP_COMMANDS = frozenset({
+    "blfootnote",
+    "footnote",
+    "footnotetext",
+    "thanks",
+    "Huge",
+    "huge",
+    "LARGE",
+    "Large",
+    "large",
+    "normalsize",
+    "small",
+    "footnotesize",
+    "scriptsize",
+    "tiny",
+    "bigskip",
+    "medskip",
+    "smallskip",
+    "vspace",
+    "hspace",
+})
+_TITLE_DROP_ARGUMENTS = MappingProxyType({
+    "blfootnote": "{",
+    "footnote": "{",
+    "footnotetext": "{",
+    "thanks": "{",
+})
+
+
+def _strip_title_display_commands(
+    text: str,
+    macros: Mapping[str, MacroDefinition],
+) -> str:
+    argspecs = {
+        name: _macro_invocation_argspec(definition)
+        for name, definition in macros.items()
+    }
+    argspecs.update(_TITLE_DROP_ARGUMENTS)
+    source = SourceFile(Path("<title-display>"), text)
+    document = LatexDocument(source, macro_args=argspecs)
+    edits = [
+        Edit(
+            source.path,
+            ref.start,
+            ref.end,
+            "",
+            "strip_title_display_commands",
+            Safety.SAFE,
+        )
+        for name in _TITLE_DROP_COMMANDS
+        for ref in document.commands(name)
+        if ref.complete and not ref.opaque
+    ]
+    return EditPlanner.apply(source, edits)
+
+
 def _macro_replacement(
     document: LatexDocument,
     ref: LatexNodeRef,
@@ -1329,8 +1624,10 @@ def expand_macros(
 
 def _format_title(raw: str, macros: Mapping[str, MacroDefinition]) -> str:
     # Lexical display cleanup over an already parsed title argument.
+    raw = _strip_title_display_commands(raw, macros)
     raw = re.sub(r"\\\\", " ", raw)
     raw = expand_macros(raw, dict(macros))
+    raw = _strip_title_display_commands(raw, macros)
     for _ in range(5):
         unwrapped = re.sub(r"\\[a-zA-Z]+\{([^{}]*)\}", r"\1", raw)
         if unwrapped == raw:
@@ -1952,6 +2249,8 @@ def plan_algorithms(snapshot: DocumentSnapshot) -> PlanOutcome:
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 TRANSLATE_MODEL = "qwen3.6-flash"
+TRANSLATION_BATCH_MAX_CHARS = 24_000
+TRANSLATION_BATCH_WORKERS = 5
 _HEADING_TRANSLATION_MARKER = "% paper2epub:heading-translation"
 _TRANSLATION_BEGIN_PREFIX = "% paper2epub:translation-begin:"
 _TRANSLATION_END_PREFIX = "% paper2epub:translation-end:"
@@ -2001,10 +2300,19 @@ SKIP_ENV_NAMES = {
 }
 
 TRANSLATABLE_HEADING_NAMES = (
+    "chapter",
     "section",
     "subsection",
     "subsubsection",
     "paragraph",
+)
+
+_TRANSLATION_STRIP_COMMAND_NAMES = (
+    *TRANSLATABLE_HEADING_NAMES,
+    "input",
+    "include",
+    "label",
+    "item",
 )
 
 
@@ -2118,7 +2426,7 @@ def _adjacent_complete_label_end(
     for label in document.commands("label"):
         if label.start < ref.end:
             continue
-        if content[ref.end:label.start].strip():
+        if strip_tex_comments(content[ref.end:label.start]).strip():
             break
         if not _untrusted(label):
             return label.end
@@ -2192,6 +2500,36 @@ def _chunk_ranges(content: str) -> list[tuple[int, int]]:
     return ranges
 
 
+def _translation_chunk_ranges(
+    content: str,
+    document: LatexDocument,
+) -> list[tuple[int, int]]:
+    math_ranges = [
+        (ref.start, ref.end)
+        for ref in document.math
+        if ref.display or not ref.complete
+    ]
+    candidate_boundaries = {0, len(content)}
+    for start, end in _chunk_ranges(content):
+        candidate_boundaries.update((start, end))
+    for start, end in _iter_environment_token_ranges(content):
+        candidate_boundaries.update((start, end))
+    candidate_boundaries.update(
+        ref.start
+        for ref in document.commands("item")
+        if ref.complete and not ref.opaque
+    )
+    boundaries = {
+        boundary
+        for boundary in candidate_boundaries
+        if not any(start < boundary < end for start, end in math_ranges)
+    }
+    for start, end in math_ranges:
+        boundaries.update((start, end))
+    ordered = sorted(boundaries)
+    return list(zip(ordered, ordered[1:]))
+
+
 @dataclass(frozen=True)
 class _TranslationBlock:
     digest: str
@@ -2257,7 +2595,13 @@ def translation_skip_ranges(document: LatexDocument) -> list[tuple[int, int]]:
         for ref in document.environments(name)
         if not _untrusted(ref)
     )
-    return [(ref.start, ref.end) for ref in refs]
+    ranges = [(ref.start, ref.end) for ref in refs]
+    ranges.extend(
+        (ref.start, ref.end)
+        for ref in document.math
+        if ref.display or not ref.complete
+    )
+    return list(_merge_ranges(ranges))
 
 
 def _ref_is_within_ranges(
@@ -2303,8 +2647,83 @@ def _has_balanced_braces(text: str) -> bool:
     return depth == 0
 
 
+_MATH_PLACEHOLDER_RE = re.compile(r"⟦P2E_MATH_[^⟧\s]+⟧")
+
+
+@dataclass(frozen=True)
+class _ProtectedTranslationText:
+    prompt_text: str
+    replacements: tuple[tuple[str, str], ...]
+
+
+def _protect_translation_math(text: str) -> _ProtectedTranslationText:
+    source = SourceFile(Path("<translation-math-protection>"), text)
+    document = LatexDocument(source)
+    replacements: list[tuple[str, str]] = []
+    edits: list[Edit] = []
+    for index, ref in enumerate(document.math):
+        if not ref.complete:
+            continue
+        math = text[ref.start:ref.end]
+        digest = hashlib.sha256(math.encode("utf-8")).hexdigest()[:12]
+        token = f"⟦P2E_MATH_{index}_{digest}⟧"
+        replacements.append((token, math))
+        edits.append(Edit(
+            source.path,
+            ref.start,
+            ref.end,
+            token,
+            "protect_translation_math",
+            Safety.SAFE,
+        ))
+    return _ProtectedTranslationText(
+        prompt_text=EditPlanner.apply(source, edits),
+        replacements=tuple(replacements),
+    )
+
+
+def _restore_translation_math(
+    protected: _ProtectedTranslationText,
+    candidate: str | None,
+) -> str | None:
+    if _translation_candidate_issue(protected, candidate) is not None:
+        return None
+
+    assert candidate is not None
+    restored = candidate
+    for token, math in protected.replacements:
+        restored = restored.replace(token, math)
+    return restored
+
+
+def _translation_candidate_issue(
+    protected: _ProtectedTranslationText,
+    candidate: str | None,
+) -> str | None:
+    if not candidate:
+        return "missing response"
+    if not _has_balanced_braces(candidate):
+        return "unbalanced braces"
+
+    expected = Counter(token for token, _ in protected.replacements)
+    actual = Counter(_MATH_PLACEHOLDER_RE.findall(candidate))
+    if actual != expected:
+        missing = sum((expected - actual).values())
+        unexpected = sum((actual - expected).values())
+        return (
+            "math placeholder mismatch "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
+
+    candidate_source = SourceFile(Path("<translation-candidate>"), candidate)
+    if LatexDocument(candidate_source).math:
+        return "unexpected raw math"
+    return None
+
+
 def _request_numbered_translation(
-    client, system_prompt: str, numbered_paragraphs: dict[int, str]
+    client, system_prompt: str, numbered_paragraphs: dict[int, str],
+    request_limiter=None,
 ) -> dict[int, str]:
     user_prompt = "\n\n".join(
         f"[{idx}]\n{numbered_paragraphs[idx]}"
@@ -2313,7 +2732,11 @@ def _request_numbered_translation(
 
     for attempt in range(3):
         try:
-            raw = _chat(client, system_prompt, user_prompt)
+            if request_limiter is None:
+                raw = _chat(client, system_prompt, user_prompt)
+            else:
+                with request_limiter:
+                    raw = _chat(client, system_prompt, user_prompt)
             return _parse_numbered_response(raw)
         except Exception as e:
             if attempt < 2:
@@ -2327,8 +2750,104 @@ def _request_numbered_translation(
     raise AssertionError("unreachable")
 
 
+def _partition_translation_batches(
+    numbered_paragraphs: Mapping[int, str],
+    *,
+    max_chars: int = TRANSLATION_BATCH_MAX_CHARS,
+) -> tuple[dict[int, str], ...]:
+    if max_chars <= 0:
+        raise ValueError("translation batch limit must be positive")
+
+    batches: list[dict[int, str]] = []
+    current: dict[int, str] = {}
+    current_chars = 0
+    for index, paragraph in numbered_paragraphs.items():
+        if current and current_chars + len(paragraph) > max_chars:
+            batches.append(current)
+            current = {}
+            current_chars = 0
+        current[index] = paragraph
+        current_chars += len(paragraph)
+    if current:
+        batches.append(current)
+    return tuple(batches)
+
+
+def _translate_numbered_batch(
+    client, system_prompt: str, numbered_paragraphs: dict[int, str],
+    request_limiter=None,
+) -> dict[int, str]:
+    protected = {
+        idx: _protect_translation_math(text)
+        for idx, text in numbered_paragraphs.items()
+    }
+    prompt_paragraphs = {
+        idx: item.prompt_text for idx, item in protected.items()
+    }
+    raw_translations = _request_numbered_translation(
+        client, system_prompt, prompt_paragraphs, request_limiter,
+    )
+    translations = {
+        idx: restored
+        for idx, candidate in raw_translations.items()
+        if idx in protected
+        if (restored := _restore_translation_math(protected[idx], candidate))
+        is not None
+    }
+    retry_paragraphs = {
+        idx: prompt_paragraphs[idx]
+        for idx in numbered_paragraphs
+        if idx not in translations
+    }
+    retried: dict[int, str] = {}
+    if retry_paragraphs:
+        try:
+            retried = _request_numbered_translation(
+                client, system_prompt, retry_paragraphs, request_limiter,
+            )
+        except Exception as e:
+            joined = ", ".join(str(idx) for idx in retry_paragraphs)
+            print(
+                f"translation: retry failed; skipped paragraph IDs: {joined} "
+                f"({e})",
+                file=sys.stderr,
+            )
+            return {
+                idx: translations[idx]
+                for idx in numbered_paragraphs
+                if idx in translations
+            }
+        for idx in retry_paragraphs:
+            candidate = retried.get(idx)
+            restored = _restore_translation_math(protected[idx], candidate)
+            if restored is not None:
+                translations[idx] = restored
+
+    invalid_ids = [
+        idx
+        for idx in numbered_paragraphs
+        if idx not in translations
+    ]
+    if invalid_ids:
+        details = ", ".join(
+            f"{idx} ({_translation_candidate_issue(protected[idx], retried.get(idx))})"
+            for idx in invalid_ids
+        )
+        print(
+            f"translation: skipped invalid paragraph IDs: {details}",
+            file=sys.stderr,
+        )
+
+    return {
+        idx: translations[idx]
+        for idx in numbered_paragraphs
+        if idx in translations
+    }
+
+
 def _batch_translate(
-    client, glossary: str, numbered_paragraphs: dict[int, str]
+    client, glossary: str, numbered_paragraphs: dict[int, str],
+    request_limiter=None,
 ) -> dict[int, str]:
     if not numbered_paragraphs:
         return {}
@@ -2339,46 +2858,50 @@ def _batch_translate(
         "要求：\n"
         "1. 保持学术论文的专业性和准确性\n"
         "2. 严格按照术语对照表翻译术语，标注'保留英文'的术语保留英文原文\n"
-        "3. 数学公式和LaTeX命令保持不变\n"
+        "3. 最高优先级约束：输入中所有形如 ⟦P2E_MATH_...⟧ 的字符串都是不可编辑的"
+        "数学公式占位符，不是待翻译文本。必须将每个占位符完整、逐字复制到对应"
+        "编号的译文中，并保持其所在语义位置；禁止删除、增添、翻译、改写、转义、"
+        "拆分占位符，禁止修改其中任何字符或插入空格、换行。每个占位符必须在对应"
+        "译文中出现且仅出现一次，且不得移动到其他编号的段落。输出前逐段核对占位符的"
+        "内容和数量；即使无法翻译某段，也必须原样保留其中的全部占位符。\n"
         "4. 引用标记保持不变\n"
         "5. 译文流畅自然，符合中文科技论文的表达习惯\n"
         "6. 每段译文前标注对应编号，格式为 [编号]，然后换行输出译文\n"
         "7. 只输出翻译结果，不要添加任何解释"
     )
-
-    translations = _request_numbered_translation(
-        client, system_prompt, numbered_paragraphs
+    batches = _partition_translation_batches(
+        numbered_paragraphs,
+        max_chars=TRANSLATION_BATCH_MAX_CHARS,
     )
-    retry_paragraphs = {
-        idx: text
-        for idx, text in numbered_paragraphs.items()
-        if idx not in translations or not _has_balanced_braces(translations[idx])
-    }
-    if retry_paragraphs:
+    if len(batches) == 1:
+        if request_limiter is None:
+            return _translate_numbered_batch(client, system_prompt, batches[0])
+        return _translate_numbered_batch(
+            client, system_prompt, batches[0], request_limiter,
+        )
+
+    translations: dict[int, str] = {}
+    with ThreadPoolExecutor(
+        max_workers=min(TRANSLATION_BATCH_WORKERS, len(batches))
+    ) as pool:
+        futures = []
+        for batch in batches:
+            args = (client, system_prompt, batch)
+            if request_limiter is not None:
+                args += (request_limiter,)
+            futures.append(pool.submit(_translate_numbered_batch, *args))
         try:
-            retried = _request_numbered_translation(
-                client, system_prompt, retry_paragraphs
-            )
-        except Exception as e:
-            joined = ", ".join(str(idx) for idx in retry_paragraphs)
-            raise RuntimeError(
-                f"translation retry failed for paragraph IDs: {joined}"
-            ) from e
-        for idx in retry_paragraphs:
-            candidate = retried.get(idx)
-            if candidate and _has_balanced_braces(candidate):
-                translations[idx] = candidate
-
-    invalid_ids = [
-        idx
-        for idx in numbered_paragraphs
-        if idx not in translations or not _has_balanced_braces(translations[idx])
-    ]
-    if invalid_ids:
-        joined = ", ".join(str(idx) for idx in invalid_ids)
-        raise RuntimeError(f"incomplete translation for paragraph IDs: {joined}")
-
-    return {idx: translations[idx] for idx in numbered_paragraphs}
+            for future in as_completed(futures):
+                translations.update(future.result())
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
+    return {
+        index: translations[index]
+        for index in numbered_paragraphs
+        if index in translations
+    }
 
 
 def _translate_heading_texts(client, glossary: str, texts: list[str]) -> dict[int, str]:
@@ -2461,6 +2984,42 @@ def _slice_without_ranges(
     return "".join(parts)
 
 
+def _merge_ranges(
+    ranges: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if start >= end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _translation_projection_ranges(
+    content: str,
+    document: LatexDocument,
+    heading_ranges: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    ranges = list(heading_ranges)
+    ranges.extend(document.comment_ranges)
+    ranges.extend(_iter_environment_token_ranges(content))
+    ranges.extend(
+        (ref.start, ref.end)
+        for ref in document.math
+        if ref.display or not ref.complete
+    )
+    for name in _TRANSLATION_STRIP_COMMAND_NAMES:
+        ranges.extend(
+            (ref.start, ref.end)
+            for ref in document.commands(name)
+            if ref.complete and not ref.opaque
+        )
+    return _merge_ranges(ranges)
+
+
 def _canonical_translation_prose(text: str) -> str:
     text = _strip_env_wrappers(text)
     text = _strip_heading_lines(text)
@@ -2505,7 +3064,8 @@ def _translate_headings(heading_translations: dict[str, str], content: str) -> s
 
 
 def translate_file_content(
-    client, glossary: str, heading_translations: dict[str, str], content: str
+    client, glossary: str, heading_translations: dict[str, str], content: str,
+    request_limiter=None,
 ) -> str:
     source = SourceFile(Path("<translation-content>"), content)
     document = LatexDocument(source)
@@ -2513,12 +3073,15 @@ def translate_file_content(
     heading_ranges = _generated_heading_ranges(
         heading_translations, source, document,
     )
-    chunk_positions = _chunk_ranges(content)
+    projection_ranges = _translation_projection_ranges(
+        content, document, heading_ranges,
+    )
+    chunk_positions = _translation_chunk_ranges(content, document)
     chunks = [content[start:end] for start, end in chunk_positions]
     prose_chunks = [
-        _canonical_translation_prose(
-            _slice_without_ranges(content, start, end, heading_ranges)
-        )
+        _slice_without_ranges(
+            content, start, end, projection_ranges,
+        ).strip()
         for start, end in chunk_positions
     ]
     newline = source.newline
@@ -2555,7 +3118,12 @@ def translate_file_content(
     if not numbered:
         return _translate_headings(heading_translations, content)
 
-    translations = _batch_translate(client, glossary, numbered)
+    if request_limiter is None:
+        translations = _batch_translate(client, glossary, numbered)
+    else:
+        translations = _batch_translate(
+            client, glossary, numbered, request_limiter,
+        )
 
     edits = [
         Edit(
@@ -2571,6 +3139,14 @@ def translate_file_content(
                 + newline
                 + _TRANSLATION_END_PREFIX
                 + _translation_digest(prose_chunks[i])
+                + (
+                    newline
+                    if (
+                        chunk_positions[i][1] < len(content)
+                        and content[chunk_positions[i][1]] not in "\r\n"
+                    )
+                    else ""
+                )
             ),
             "translate_paragraph",
             Safety.LOSSY,
@@ -2588,6 +3164,20 @@ class BarrierResult:
 
 
 SourceTranslator = Callable[[SourceFile, DiscoveryFacts], str]
+
+
+def _unique_lexical_document_body_range(
+    content: str,
+) -> tuple[int, int] | None:
+    begin_token = r"\begin{document}"
+    end_token = r"\end{document}"
+    if content.count(begin_token) != 1 or content.count(end_token) != 1:
+        return None
+    body_start = content.index(begin_token) + len(begin_token)
+    body_end = content.index(end_token)
+    if body_start > body_end:
+        return None
+    return body_start, body_end
 
 
 class TranslationBarrier:
@@ -2628,12 +3218,27 @@ class TranslationBarrier:
                 ref = document_refs[0]
                 issue = _reference_issue(source, ref, self.name)
                 if issue is not None:
-                    diagnostics.extend(issue.diagnostics)
-                    continue
-                body_range = (ref.body_start, ref.body_end)
+                    if ref.file != source.path:
+                        diagnostics.extend(issue.diagnostics)
+                        continue
+                    body_range = _unique_lexical_document_body_range(
+                        source.content,
+                    )
+                    if body_range is None:
+                        diagnostics.extend(issue.diagnostics)
+                        continue
+                    diagnostics.append(Diagnostic(
+                        source.path,
+                        self.name,
+                        "lexical-document-boundary-fallback",
+                        "translated main source using unique lexical document boundaries",
+                        *body_range,
+                    ))
+                else:
+                    body_range = (ref.body_start, ref.body_end)
                 source = SourceFile(
                     path,
-                    source.content[ref.body_start:ref.body_end],
+                    source.content[body_range[0]:body_range[1]],
                 )
             jobs[path] = (source, body_range)
 
@@ -2791,6 +3396,133 @@ def plan_unnumber_paragraphs(
             )
         )
     return edits
+
+
+_HEADING_LEVELS = {
+    "chapter": 0,
+    "section": 1,
+    "subsection": 2,
+    "subsubsection": 3,
+}
+
+
+def _appendix_letter(number: int) -> str:
+    """Format a one-based appendix number like spreadsheet columns."""
+    letters = ""
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
+def plan_preserve_appendix_numbering(
+    snapshot: DocumentSnapshot,
+) -> PlanOutcome:
+    """Make appendix numbers explicit before pandoc drops ``\\appendix``."""
+    if snapshot.discovery is None:
+        raise PipelineContractError("appendix numbering requires discovery facts")
+    ordered_paths = list(snapshot.discovery.include_order)
+    ordered_paths.extend(
+        path for path in snapshot.sources if path not in ordered_paths
+    )
+    events: list[tuple[int, int, SourceFile, LatexNodeRef]] = []
+    for path_index, path in enumerate(ordered_paths):
+        source = snapshot.sources[path]
+        document = snapshot.documents[path]
+        refs = document.commands("appendix")
+        for name in _HEADING_LEVELS:
+            refs.extend(document.commands(name))
+        events.extend(
+            (path_index, ref.start, source, ref)
+            for ref in refs
+        )
+    events.sort(key=lambda item: (item[0], item[1]))
+    appendix_index = next(
+        (index for index, event in enumerate(events) if event[3].name == "appendix"),
+        None,
+    )
+    if appendix_index is None:
+        return PlanOutcome()
+    numbered_after = [
+        ref for *_, ref in events[appendix_index + 1:]
+        if ref.name in _HEADING_LEVELS
+        and not _untrusted(ref)
+        and (not ref.arguments or ref.arguments[0] is None)
+    ]
+    if not numbered_after:
+        return PlanOutcome()
+    top_level = min(_HEADING_LEVELS[ref.name] for ref in numbered_after)
+    counters = [0] * len(_HEADING_LEVELS)
+    outcomes: list[PlanOutcome] = []
+    active = False
+    for _, _, source, ref in events:
+        if ref.name == "appendix":
+            active = True
+            issue = _reference_issue(
+                source, ref, "preserve_appendix_numbering",
+            )
+            if issue is not None:
+                outcomes.append(issue)
+                continue
+            start, end = _whole_line_range_if_alone(
+                source.content, ref.start, ref.end,
+            )
+            outcomes.append(PlanOutcome(edits=(Edit(
+                source.path,
+                start,
+                end,
+                "",
+                "preserve_appendix_numbering",
+                Safety.SAFE,
+            ),)))
+            continue
+        if not active or _untrusted(ref):
+            continue
+        level = _HEADING_LEVELS[ref.name]
+        if level < top_level or (ref.arguments and ref.arguments[0] is not None):
+            continue
+        title = _public_argument(ref, 0)
+        if title is None or not title.complete or title.opaque:
+            continue
+        counters[level] += 1
+        for deeper in range(level + 1, len(counters)):
+            counters[deeper] = 0
+        parts = [_appendix_letter(counters[top_level])]
+        parts.extend(
+            str(counters[index])
+            for index in range(top_level + 1, level + 1)
+        )
+        prefix = ".".join(parts) + " "
+        edits = [Edit(
+            source.path,
+            ref.command_token_end,
+            ref.command_token_end,
+            "*",
+            "preserve_appendix_numbering",
+            Safety.SAFE,
+        )]
+        title_start = title.start + len(title.opening_delimiter or "")
+        edits.append(Edit(
+            source.path,
+            title_start,
+            title_start,
+            prefix,
+            "preserve_appendix_numbering",
+            Safety.SAFE,
+        ))
+        optional = ref.arguments[1] if len(ref.arguments) > 1 else None
+        if optional is not None and optional.complete and not optional.opaque:
+            optional_start = optional.start + len(optional.opening_delimiter or "")
+            edits.append(Edit(
+                source.path,
+                optional_start,
+                optional_start,
+                prefix,
+                "preserve_appendix_numbering",
+                Safety.SAFE,
+            ))
+        outcomes.append(PlanOutcome(edits=tuple(edits)))
+    return _combine_outcomes(outcomes)
 
 
 # ---------------------------------------------------------------------------
@@ -3001,6 +3733,8 @@ _NOISE_TWO_ARG = [
 
 _STRIP_ENVS = {"tikzpicture", "comment", "CCSXML"}
 
+_PANDOC_INCOMPATIBLE_FONT_DECLARATIONS = ("tiny",)
+
 
 def plan_strip_noise(
     source: SourceFile,
@@ -3053,7 +3787,35 @@ def plan_strip_noise(
             "strip_noise_commands",
             Safety.LOSSY,
         ),)))
-    return _combine_outcomes(outcomes)
+    # A definition such as
+    # \newenvironment{x}{\begin{minipage}}{\end{minipage}} can make
+    # pylatexenc conservatively mark the rest of the file opaque.  These
+    # declarations are argument-free presentation tokens, so removing only
+    # their parser-owned command token remains bounded even in that case and
+    # prevents pandoc's MathML reader from rejecting them inside formulas.
+    definition_name_ranges = tuple(
+        (argument.start, argument.end)
+        for definition_command in _DEFINITION_COMMANDS
+        for definition in document.commands(definition_command)
+        if (argument := document.argument(definition, 1)) is not None
+    )
+    protected_ranges = (*removed_ranges, *definition_name_ranges)
+    for command in _PANDOC_INCOMPATIBLE_FONT_DECLARATIONS:
+        for ref in document.commands(command):
+            if any(
+                start <= ref.start and ref.end <= end
+                for start, end in protected_ranges
+            ):
+                continue
+            outcomes.append(PlanOutcome(edits=(Edit(
+                source.path,
+                ref.start,
+                ref.command_token_end,
+                "",
+                "strip_noise_commands",
+                Safety.LOSSY,
+            ),)))
+    return _suppress_contained_edits(_combine_outcomes(outcomes))
 
 
 # ---------------------------------------------------------------------------
@@ -4119,6 +4881,258 @@ def convert_pdf_resources(paper_dir: Path) -> ResourceResult:
     return ResourceResult(frozenset(converted), tuple(diagnostics))
 
 
+def plan_replace_tikz_figure(
+    source: SourceFile,
+    document: LatexDocument,
+    figure: LatexNodeRef,
+    image_reference: str,
+) -> PlanOutcome:
+    """Replace a figure's TikZ body while preserving its outer caption/label."""
+    pass_name = "convert_tikz_resources"
+    issue = _reference_issue(source, figure, pass_name)
+    if issue is not None:
+        return issue
+    tikz_refs = [
+        ref for ref in document.environments("tikzpicture")
+        if figure.body_start <= ref.start and ref.end <= figure.body_end
+    ]
+    if not tikz_refs:
+        return PlanOutcome()
+    captions = [
+        ref for ref in document.commands("caption")
+        if figure.body_start <= ref.start and ref.end <= figure.body_end
+        and not _untrusted(ref)
+    ]
+    tail_start = captions[-1].start if captions else figure.body_end
+    inner_labels = [
+        label.strip()
+        for ref in document.commands("label")
+        if figure.body_start <= ref.start and ref.end <= tail_start
+        and not _untrusted(ref)
+        for label in [document.argument_text(ref, 0)]
+        if label and label.strip()
+    ]
+    replacement = (
+        source.newline
+        + r"\centering"
+        + source.newline
+        + rf"\includegraphics[width=\linewidth]{{{image_reference}}}"
+        + source.newline
+        + "".join(
+            rf"\label{{{label}}}" + source.newline
+            for label in inner_labels
+        )
+    )
+    return PlanOutcome(edits=(Edit(
+        source.path,
+        figure.body_start,
+        tail_start,
+        replacement,
+        pass_name,
+        Safety.LOSSY,
+    ),))
+
+
+def _ordered_figure_refs(
+    snapshot: DocumentSnapshot,
+) -> list[tuple[SourceFile, LatexDocument, LatexNodeRef, bool]]:
+    if snapshot.discovery is None:
+        raise PipelineContractError("TikZ conversion requires discovery facts")
+    ordered_paths = list(snapshot.discovery.include_order)
+    ordered_paths.extend(
+        path for path in snapshot.sources if path not in ordered_paths
+    )
+    figures: list[tuple[SourceFile, LatexDocument, LatexNodeRef, bool]] = []
+    for path in ordered_paths:
+        source = snapshot.sources[path]
+        document = snapshot.documents[path]
+        tikz_refs = document.environments("tikzpicture")
+        for name in ("figure", "figure*"):
+            for figure in document.environments(name):
+                has_caption = any(
+                    figure.body_start <= ref.start and ref.end <= figure.body_end
+                    for ref in document.commands("caption")
+                )
+                if not has_caption:
+                    continue
+                has_tikz = any(
+                    figure.body_start <= ref.start and ref.end <= figure.body_end
+                    for ref in tikz_refs
+                )
+                figures.append((source, document, figure, has_tikz))
+    return sorted(figures, key=lambda item: (
+        ordered_paths.index(item[0].path), item[2].start,
+    ))
+
+
+def _pdf_figure_captions(pdf) -> list[tuple[int, float]]:
+    """Return ``(page index, caption top)`` for numbered PDF figures."""
+    captions: list[tuple[int, float]] = []
+    pattern = re.compile(r"Figure\s+(?:[A-Z]+|\d+)(?:\.\d+)*:")
+    for page_index, page in enumerate(pdf):
+        text_page = page.get_textpage()
+        text = text_page.get_text_range()
+        for match in pattern.finditer(text):
+            boxes = [
+                text_page.get_charbox(index)
+                for index in range(match.start(), match.end())
+                if not text[index].isspace()
+            ]
+            if boxes:
+                captions.append((
+                    page_index,
+                    max(box[3] for box in boxes),
+                ))
+    return captions
+
+
+def _crop_figure_above_caption(page, caption_top: float, output: Path) -> None:
+    """Rasterize and crop the nearest ink band immediately above a caption."""
+    scale = 4
+    image = page.render(scale=scale).to_pil().convert("RGB")
+    page_width, page_height = page.get_size()
+    # TikZ is emitted as PDF path objects. Group the path bands nearest the
+    # caption; this preserves multi-row panels even when whitespace separates
+    # their rows, while avoiding unrelated prose above the float.
+    objects: list[tuple[float, float, float, float]] = []
+    for obj in page.get_objects():
+        if type(obj).__name__ == "PdfTextObj":
+            continue
+        x0, y0, x1, y1 = obj.get_bounds()
+        if y0 >= caption_top and x1 >= 45 and x0 <= page_width - 45:
+            objects.append((x0, y0, x1, y1))
+    objects.sort(key=lambda bounds: bounds[1])
+    selected: list[tuple[float, float, float, float]] = []
+    band_top = caption_top
+    for bounds in objects:
+        if not selected or bounds[1] - band_top <= 45:
+            selected.append(bounds)
+            band_top = max(band_top, bounds[3])
+        else:
+            break
+    if selected:
+        padding = 15
+        y0 = max(caption_top, min(bounds[1] for bounds in selected) - padding)
+        y1 = min(page_height, max(bounds[3] for bounds in selected) + padding)
+        crop_top = round((page_height - y1) * scale)
+        crop_bottom = round((page_height - y0) * scale)
+        search_left = round(35 * scale)
+        search_right = round((page_width - 35) * scale)
+        gray_region = image.convert("L").crop((
+            search_left, crop_top, search_right, crop_bottom,
+        ))
+        mask = gray_region.point(lambda value: 255 if value < 245 else 0)
+        ink = mask.getbbox()
+        if ink is None:
+            raise ValueError("figure path band contains no rendered content")
+        pixel_padding = 6 * scale
+        crop = (
+            max(search_left, search_left + ink[0] - pixel_padding),
+            crop_top,
+            min(search_right, search_left + ink[2] + pixel_padding),
+            crop_bottom,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        image.crop(crop).save(output)
+        return
+
+    # Fallback for PDFs that flatten paths into a bitmap or form object.
+    gray = image.convert("L")
+    left = max(0, round(45 * scale))
+    right = min(image.width, round((page_width - 45) * scale))
+    caption_y = max(0, round((page_height - caption_top) * scale))
+    dark_threshold = 245
+    minimum_dark = max(2, scale)
+
+    def row_has_ink(y: int) -> bool:
+        row = gray.crop((left, y, right, y + 1))
+        return sum(row.histogram()[:dark_threshold]) >= minimum_dark
+
+    y = min(caption_y - 1, image.height - 1)
+    while y > 0 and not row_has_ink(y):
+        y -= 1
+    bottom = y + 1
+    blank_needed = 8 * scale
+    blank_run = 0
+    minimum_height = 20 * scale
+    while y > 0:
+        y -= 1
+        if row_has_ink(y):
+            blank_run = 0
+        else:
+            blank_run += 1
+            if blank_run >= blank_needed and bottom - y >= minimum_height:
+                break
+    top = y + blank_run
+    if bottom - top < minimum_height:
+        raise ValueError("could not identify figure content above caption")
+
+    region = gray.crop((left, top, right, bottom))
+    mask = region.point(lambda value: 255 if value < dark_threshold else 0)
+    bbox = mask.getbbox()
+    if bbox is None:
+        raise ValueError("figure crop contains no rendered content")
+    padding = 6 * scale
+    crop_left = max(left, left + bbox[0] - padding)
+    crop_top = max(0, top + bbox[1] - padding)
+    crop_right = min(right, left + bbox[2] + padding)
+    crop_bottom = min(caption_y, top + bbox[3] + padding)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.crop((crop_left, crop_top, crop_right, crop_bottom)).save(output)
+
+
+def convert_tikz_resources(
+    snapshot: DocumentSnapshot,
+    pdf_path: Path,
+) -> tuple[PlanOutcome, tuple[Diagnostic, ...]]:
+    """Extract rendered TikZ figures from arXiv's PDF and plan source rewrites."""
+    import pypdfium2 as pdfium
+
+    figures = _ordered_figure_refs(snapshot)
+    if not any(has_tikz for *_, has_tikz in figures):
+        return PlanOutcome(), ()
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    captions = _pdf_figure_captions(pdf)
+    if len(captions) != len(figures):
+        diagnostic = Diagnostic(
+            snapshot.main_tex,
+            "convert_tikz_resources",
+            "figure-count-mismatch",
+            f"preserved TikZ because source has {len(figures)} numbered figures "
+            f"but PDF has {len(captions)} figure captions",
+        )
+        return PlanOutcome(), (diagnostic,)
+
+    outcomes: list[PlanOutcome] = []
+    diagnostics: list[Diagnostic] = []
+    image_dir = snapshot.root / "paper2epub-figures"
+    converted_index = 0
+    for figure_index, (source, document, figure, has_tikz) in enumerate(figures):
+        if not has_tikz:
+            continue
+        converted_index += 1
+        image_path = image_dir / f"tikz-{converted_index:03d}.png"
+        page_index, caption_top = captions[figure_index]
+        try:
+            _crop_figure_above_caption(pdf[page_index], caption_top, image_path)
+        except Exception as error:
+            diagnostics.append(Diagnostic(
+                source.path,
+                "convert_tikz_resources",
+                "tikz-extraction-failed",
+                f"could not extract TikZ figure {converted_index}: {error}",
+                figure.start,
+                figure.end,
+            ))
+            continue
+        reference = os.path.relpath(image_path, source.path.parent)
+        outcomes.append(plan_replace_tikz_figure(
+            source, document, figure, reference,
+        ))
+        print(f"Extracted TikZ: PDF page {page_index + 1} -> {image_path}")
+    return _combine_outcomes(outcomes), tuple(diagnostics)
+
+
 def _resolve_converted_pdf(
     source_path: Path,
     reference: str,
@@ -4531,6 +5545,7 @@ def build_preprocessing_plan(
     translation_client=None,
     translator: SourceTranslator | None = None,
     resource_converter: Callable[[Path], ResourceResult] = convert_pdf_resources,
+    tikz_pdf: Path | None = None,
 ) -> PreprocessingPlan:
     """Assemble the one authoritative, transactionally executed pipeline."""
     steps: list[PreprocessingStep] = []
@@ -4541,6 +5556,47 @@ def build_preprocessing_plan(
 
     steps.append(PreprocessingStep(
         "discover", discover, phase=Phase.DISCOVERY,
+    ))
+
+    def convert_tikz(state: PreprocessingState) -> PreprocessingState:
+        if tikz_pdf is None:
+            return state
+        snapshot = state.snapshot
+        if Fact.SYNTAX not in snapshot.current_facts:
+            snapshot = rebuild_syntax(snapshot)
+        if snapshot.discovery is None:
+            snapshot = build_discovery_facts(snapshot)
+        outcome, diagnostics = convert_tikz_resources(snapshot, tikz_pdf)
+        if not outcome.edits:
+            return replace(
+                state,
+                snapshot=snapshot,
+                diagnostics=state.diagnostics + diagnostics,
+            )
+        grouped: dict[Path, list[Edit]] = {}
+        for edit in outcome.edits:
+            grouped.setdefault(edit.file, []).append(edit)
+        sources = dict(snapshot.sources)
+        for path, edits in grouped.items():
+            sources[path] = SourceFile(
+                path, EditPlanner.apply(snapshot.sources[path], edits),
+            )
+        snapshot = replace(
+            snapshot,
+            revision=snapshot.revision + 1,
+            sources=read_only_mapping(sources),
+            documents=read_only_mapping({}),
+            current_facts=snapshot.current_facts - {Fact.SYNTAX},
+        )
+        return replace(
+            state,
+            snapshot=snapshot,
+            diagnostics=state.diagnostics + diagnostics + outcome.diagnostics,
+        )
+
+    steps.append(PreprocessingStep(
+        "convert_tikz_resources", convert_tikz,
+        phase=Phase.COMPATIBILITY, safety=Safety.LOSSY,
     ))
     steps.extend(_step_from_pass(replace(
         spec, after=frozenset(), before=frozenset(),
@@ -4641,9 +5697,12 @@ def build_preprocessing_plan(
                 translated_headings = _build_heading_translations(
                     translation_client, glossary, headings,
                 )
+                request_limiter = threading.BoundedSemaphore(
+                    TRANSLATION_BATCH_WORKERS,
+                )
                 source_translator = lambda source, ignored: translate_file_content(
                     translation_client, glossary, translated_headings,
-                    source.content,
+                    source.content, request_limiter,
                 )
             barrier = TranslationBarrier(source_translator).run(snapshot)
             return replace(
@@ -4659,6 +5718,11 @@ def build_preprocessing_plan(
     steps.append(_step_from_pass(make_syntax_file_pass(
         name="unnumber_paragraph_headings", planner=plan_unnumber_paragraphs,
         safety=Safety.LOSSY, phase=Phase.COMPATIBILITY, idempotent=True,
+    )))
+    steps.append(_step_from_pass(_complete_pass(
+        "preserve_appendix_numbering",
+        plan_preserve_appendix_numbering,
+        phase=Phase.COMPATIBILITY,
     )))
 
     def inputs(snapshot: DocumentSnapshot) -> PlanOutcome:
@@ -4726,7 +5790,7 @@ def _write_source_content(path: Path, content: str) -> None:
 
 
 def download(url: str, dest: Path) -> None:
-    subprocess.run(["curl", "-L", url, "-o", str(dest)], check=True)
+    subprocess.run(["curl", "-L", "--fail", url, "-o", str(dest)], check=True)
 
 
 
@@ -4813,6 +5877,82 @@ def _pandoc_resource_paths(
             paths.append(path)
     return paths
 
+
+def _numbering_scope(source: SourceFile) -> str:
+    """Return the LaTeX numbered-object scope retained by this source."""
+    document = LatexDocument(source)
+    for ref in document.commands("chapter"):
+        star = ref.arguments[0] if ref.arguments else None
+        if ref.complete and not ref.opaque and star is None:
+            return "chapter"
+    return "global"
+
+
+_NUMBERED_MATH_ENVIRONMENT = re.compile(
+    r"\\begin\s*\{(?:align|equation|eqnarray|gather|multline)\*?\}"
+)
+
+
+def _subequation_label_groups(source: SourceFile) -> tuple[tuple[str, ...], ...]:
+    """Collect each subequations parent label followed by its child labels."""
+    document = LatexDocument(source)
+    groups: list[tuple[str, ...]] = []
+    for environment in document.environments("subequations"):
+        if not environment.complete or environment.opaque:
+            continue
+        labels = [
+            (ref, document.argument_text(ref, 0))
+            for ref in document.commands("label")
+            if environment.body_start <= ref.start < ref.end <= environment.body_end
+            and ref.complete
+            and not ref.opaque
+        ]
+        labels = [(ref, label.strip()) for ref, label in labels if label]
+        if not labels:
+            continue
+        body = source.content[environment.body_start:environment.body_end]
+        nested_math = _NUMBERED_MATH_ENVIRONMENT.search(body)
+        nested_start = (
+            environment.body_start + nested_math.start()
+            if nested_math is not None
+            else environment.body_start
+        )
+        parent = labels[0][1] if labels[0][0].start < nested_start else ""
+        children = tuple(
+            label for ref, label in labels if ref.start >= nested_start
+        )
+        if children:
+            groups.append((parent, *children))
+    return tuple(groups)
+
+
+def _pandoc_numbering_scope(
+    main_tex: Path,
+    discovery: DiscoveryFacts | None,
+) -> str:
+    paths = discovery.include_order if discovery is not None else (main_tex,)
+    if main_tex not in paths:
+        paths = (main_tex, *paths)
+    return "chapter" if any(
+        _numbering_scope(SourceFile.from_path(path)) == "chapter"
+        for path in paths
+    ) else "global"
+
+
+def _pandoc_subequation_groups(
+    main_tex: Path,
+    discovery: DiscoveryFacts | None,
+) -> str:
+    paths = discovery.include_order if discovery is not None else (main_tex,)
+    if main_tex not in paths:
+        paths = (main_tex, *paths)
+    groups = (
+        group
+        for path in paths
+        for group in _subequation_label_groups(SourceFile.from_path(path))
+    )
+    return ";".join("|".join(group) for group in groups)
+
 def run_pandoc(
     main_tex: Path,
     output: Path,
@@ -4835,6 +5975,11 @@ def run_pandoc(
         "--standalone",
         "--toc",
         "--number-sections",
+        "--metadata",
+        "paper2epub-numbering-scope="
+        f"{_pandoc_numbering_scope(main_tex, discovery)}",
+        "--metadata",
+        f"paper2epub-subequations={_pandoc_subequation_groups(main_tex, discovery)}",
         f"--resource-path={':'.join(_pandoc_resource_paths(cwd, discovery))}",
         f"--css={SCRIPT_DIR / 'epub.css'}",
         f"--lua-filter={SCRIPT_DIR / 'filter.lua'}",
@@ -4953,11 +6098,33 @@ def main():
     main_tex = find_main_tex(paper_dir)
     print(f"Using TeX file: {main_tex}")
 
+    tikz_pdf: Path | None = None
+    if any(
+        r"\begin{tikzpicture}" in SourceFile.from_path(path).content
+        for path in paper_dir.rglob("*.tex")
+    ):
+        pdf_key = hashlib.sha256(arxiv_id.encode()).hexdigest()[:16]
+        tikz_pdf = Path("/tmp") / f"paper2epub-{pdf_key}.pdf"
+        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+        print(f"Downloading {pdf_url} for TikZ figures ...")
+        try:
+            download(pdf_url, tikz_pdf)
+        except subprocess.CalledProcessError as error:
+            print(
+                f"Warning: could not download PDF for TikZ figures: {error}",
+                file=sys.stderr,
+            )
+            tikz_pdf = None
+
     client = create_openai_client() if args.translate else None
     preprocessing = run_preprocessing(
         paper_dir,
         main_tex,
-        build_preprocessing_plan(args.translate, translation_client=client),
+        build_preprocessing_plan(
+            args.translate,
+            translation_client=client,
+            tikz_pdf=tikz_pdf,
+        ),
     )
     discovery = preprocessing.discovery
 

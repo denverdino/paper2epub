@@ -7,6 +7,23 @@ body {
   padding: 0 1em;
 }
 
+/* Pandoc emits the EPUB navigation document as nested ordered lists.  The
+   chapter numbers already belong to the link text, so browser list markers
+   would add a spurious "1." before the book title and every TOC entry. */
+nav#toc ol,
+ol.toc {
+  list-style-type: none !important;
+  margin-left: 0;
+}
+
+nav#toc > ol.toc {
+  padding-left: 0;
+}
+
+nav#toc ol ol {
+  padding-left: 1.25em;
+}
+
 p {
   text-align: justify;
   text-justify: inter-word;
@@ -111,6 +128,27 @@ blockquote {
 }
 
 math, .math {
+  white-space: nowrap;
+}
+
+.numbered-equation {
+  display: block;
+  position: relative;
+  width: 100%;
+}
+
+.numbered-equation > math[display="block"],
+.numbered-equation > .math.display {
+  margin-left: 3em;
+  margin-right: 3em;
+  text-align: center;
+}
+
+.equation-number {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
   white-space: nowrap;
 }
 

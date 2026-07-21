@@ -28,11 +28,14 @@ With `--translate`, it uses Alibaba Bailian's Qwen3.6-Flash model to translate t
    document class and remove `\maketitle`
 4. Strip incompatible packages, configuration, layout noise, and annotation helpers
 5. Extract paper title and authors (with macro expansion)
-6. Convert PDF figures to PNG via pypdfium2, rewrite image references
+6. Convert explicit PDF figures to PNG; when the source contains TikZ figures,
+   extract their rendered images from the arXiv PDF while preserving outer and
+   subfigure labels
 7. Normalize citations, hyperref, tables, figures, theorems, listings, and algorithms
 8. (Optional) Translate to Chinese via Qwen3.6-Flash with two-phase strategy: glossary extraction → concurrent paragraph translation
 9. Resolve `\input`/`\include` targets and append confirmed `.tex` extensions
-10. Run pandoc to produce EPUB3
+10. Run pandoc with `filter.lua` to produce EPUB3, assign source-scoped numbers
+    to equations, figures, and tables, and resolve cross-references
 
 Reference: https://info.arxiv.org/help/submit_tex.html and https://info.arxiv.org/help/submit_latex_best_practices.html
 
@@ -57,14 +60,22 @@ uv run --with pytest --with 'pylatexenc>=2.10,<3' python -m pytest test_paper2ep
   edits, safety gates, malformed input, and idempotence.
 - Tests are organized by class: `TestFindMatchingBrace`, `TestExtractBraceArg`, etc. — follow this pattern.
 - When modifying any content transform, run tests to verify no regressions.
+- **After generating an EPUB, sample it against the source PDF.** Compare at
+  least the beginning, a later chapter, and the appendix when present. Verify
+  figure/table numbering, captions, image identity and completeness, and
+  nearby text; report the sampled locations and any discrepancies.
 
 ## Code Style & Maintainability
 
 ### Architecture
 
-- **Single-file script** — all logic lives in `paper2epub.py`. Keep it that way.
-- **Avoid module-level mutable state.** `_algorithm_counter` is a known exception — don't add more.
-- **Keep preprocessing passes independent.** Each pass handles one concern (citations, hyperref, tables, etc.) and can run in any order.
+- **Single-file Python application** — orchestration and LaTeX preprocessing
+  live in `paper2epub.py`; EPUB AST transforms live in `filter.lua`. Do not
+  split the Python application into additional modules.
+- **Avoid Python module-level mutable state.** `_algorithm_counter` is a known
+  exception — don't add more.
+- **Keep preprocessing passes focused.** Each pass handles one concern
+  (citations, hyperref, tables, etc.) and is ordered by the preprocessing plan.
 - **Use syntax-aware edits for structural LaTeX.** `LatexDocument` wraps
   `pylatexenc`; `LatexNodeRef`/`LatexArgumentRef` expose repository-owned
   source ranges and completeness metadata without leaking parser nodes.
@@ -74,6 +85,23 @@ uv run --with pytest --with 'pylatexenc>=2.10,<3' python -m pytest test_paper2ep
 - **Plan before writing.** Syntax-aware passes return immutable `Edit` values;
   `EditPlanner` validates file ownership, ranges, and overlap before applying
   edits in reverse source order.
+- **Derive numbering scope from the source once.** Python scans the discovered
+  include order for a complete, numbered `\chapter` and passes either `global`
+  or `chapter` to pandoc as `paper2epub-numbering-scope`. Do not infer a second
+  scope independently in Lua.
+- **Assign numbered objects with one Lua state machine.** `filter.lua` reads the
+  metadata first, then uses one top-down document walk for chapter headers,
+  equations, figures, and tables. Equation, figure, and table counters reset at
+  each numbered chapter or explicit appendix header. Articles without numbered
+  chapters retain global counters.
+- **Keep captions and references on the same final number.** The numbering walk
+  stores each final number before prefixing captions; later `\ref`, `\autoref`,
+  and `\eqref` resolution consumes that stored value. Do not reintroduce
+  separate collection and rendering counters.
+- **Preserve TikZ label aliases.** TikZ replacement keeps labels found inside
+  the figure body. Pandoc exposes them as labeled spans inside the replacement
+  figure, and Lua maps them in document order to the parent figure number plus
+  alphabetic suffixes (`a`, `b`, ...).
 - **Files:** `paper2epub.py` (main script), `filter.lua` (pandoc Lua filter for refs/captions), `epub.css` (EPUB styling), `test_paper2epub.py` (tests).
 
 ### Preprocessing function patterns
@@ -128,6 +156,10 @@ Pass `guard="\\commandname"` to `_transform_tex_files` to skip files that don't 
 - **Input extension normalization is path-aware.**
   `_normalize_input_extensions_content` resolves targets relative to the
   referencing `.tex` file first, then the paper root.
+- **Numbering scope follows LaTeX structure.** A document with numbered
+  `\chapter` commands uses chapter-local equation/figure/table counters; an
+  explicit appendix prefix uses `A`, `B`, and so on; other documents use global
+  counters.
 
 ## Repository Workflow
 
@@ -139,7 +171,10 @@ Pass `guard="\\commandname"` to `_transform_tex_files` to skip files that don't 
 
 - Output is EPUB3 with MathML for equations, auto-generated TOC (`--toc`), and numbered sections
 - Pandoc resource path includes `.:figures:images` to resolve image references
-- `filter.lua` handles figure/table numbering in captions and resolves `\ref`/`\autoref`/`\eqref` links
+- `filter.lua` numbers equations, figures, and tables in one document-order walk;
+  captions and `\ref`/`\autoref`/`\eqref` links share the stored final numbers
+- TikZ figure replacement preserves inner labels, which resolve to subfigure
+  suffixes such as `Figure 1.7c`
 - `epub.css` styles the generated EPUB (includes `.algorithmdisplay` for algorithm blocks)
 - The `paper/` directory and `paper.tar.gz` are ephemeral working artifacts, recreated on each run
 - Dependencies are declared inline via PEP 723 metadata at the top of `paper2epub.py` — `uv` resolves them automatically

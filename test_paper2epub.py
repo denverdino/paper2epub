@@ -1,9 +1,11 @@
 """Unit tests for paper2epub.py — pure-function coverage, no network/API calls."""
 
 from dataclasses import FrozenInstanceError, replace
+import re
 import shutil
 import subprocess
 import sys
+import threading
 
 import pytest
 from pathlib import Path
@@ -74,6 +76,28 @@ class TestPassSpec:
 
 
 class TestLatexDocument:
+    def test_exposes_complete_inline_and_display_math_ranges(self, tmp_path):
+        content = r"Before $x^2$ and \[\begin{cases}a&b\end{cases}\] after"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        assert [content[ref.start:ref.end] for ref in document.math] == [
+            r"$x^2$", r"\[\begin{cases}a&b\end{cases}\]",
+        ]
+        assert [ref.display for ref in document.math] == [False, True]
+        assert all(ref.complete and not ref.opaque for ref in document.math)
+
+    def test_incomplete_math_is_opaque(self, tmp_path):
+        content = r"Before \[unfinished"
+        document = p.LatexDocument(
+            p.SourceFile(tmp_path / "main.tex", content),
+        )
+
+        assert len(document.math) == 1
+        assert document.math[0].complete is False
+        assert document.math[0].opaque is True
+
     def test_finds_nested_commands_with_source_ranges(self, tmp_path):
         content = r"Before \section{A \textbf{nested} title} after"
         source = p.SourceFile(tmp_path / "main.tex", content)
@@ -304,6 +328,160 @@ class TestLatexEnvironmentContract:
         )
 
 
+class TestMaskDefinitionEnvironmentTokens:
+    def test_masks_complete_cross_argument_environment_without_moving_offsets(self):
+        content = (
+            r"\newenvironment{dedication}"
+            r"{before \begin{minipage}[t]{1in} after}"
+            r"{before \end{minipage} after}"
+            r"\begin{document}Body\end{document}"
+        )
+        masked = p._mask_definition_environment_tokens(content)
+        assert len(masked) == len(content)
+        assert masked.index(r"\begin{document}") == content.index(r"\begin{document}")
+        assert r"\begin{minipage}" not in masked
+        assert r"\end{minipage}" not in masked
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_masks_comment_separated_tokens_without_moving_offsets(self, newline):
+        content = (
+            r"\newenvironment{dedication}"
+            + "{" + rf"\begin% begin note{newline}{{quote}}" + "}"
+            + "{" + rf"\end% end note{newline}{{quote}}" + "}"
+            + r"\begin{document}Body\end{document}"
+        )
+
+        masked = p._mask_definition_environment_tokens(content)
+
+        assert len(masked) == len(content)
+        assert masked.index(r"\begin{document}") == content.index(
+            r"\begin{document}"
+        )
+        assert r"\begin% begin note" not in masked
+        assert r"\end% end note" not in masked
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_comment_separated_mask_preserves_exact_newline_positions(self, newline):
+        content = (
+            r"\newenvironment{x}"
+            + "{" + r"before \begin% note" + newline + "{quote} after}"
+            + "{" + r"before \end% note" + newline + "{quote} after}"
+        )
+
+        masked = p._mask_definition_environment_tokens(content)
+
+        assert tuple(
+            index for index, character in enumerate(masked)
+            if character in "\r\n"
+        ) == tuple(
+            index for index, character in enumerate(content)
+            if character in "\r\n"
+        )
+        assert masked.count("\r") == content.count("\r")
+        assert masked.count("\n") == content.count("\n")
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_mask_is_non_whitespace_and_preserves_newlines(self, newline):
+        token = r"\begin% note" + newline + "{minipage}"
+        content = (
+            r"\newenvironment{x}{\hfill" + token + "}"
+            r"{\end{minipage}}"
+        )
+
+        masked = p._mask_definition_environment_tokens(content)
+        start = content.index(r"\begin")
+        end = start + len(token)
+
+        assert len(masked) == len(content)
+        assert [
+            index for index, character in enumerate(masked)
+            if character in "\r\n"
+        ] == [
+            index for index, character in enumerate(content)
+            if character in "\r\n"
+        ]
+        assert all(
+            masked[index] == content[index]
+            if content[index] in "\r\n"
+            else masked[index] == p._DEFINITION_MASK_CHARACTER
+            for index in range(start, end)
+        )
+        assert not p._DEFINITION_MASK_CHARACTER.isspace()
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "% " + r"\newenvironment{x}{" + "\n" + r"\begin{quote}}{"
+            + "\n" + r"\end{quote}}" + "\n"
+            + r"\begin{document}Body\end{document}",
+            "% " + r"\newcommand{\x}{" + "\r\n" + r"\begin{quote}}"
+            + "\r\n"
+            + r"\begin{document}Body\end{document}",
+            r"\\newenvironment{x}{\begin{quote}}{\end{quote}}"
+            r"\begin{document}Body\end{document}",
+            r"\\newcommand{\x}{\begin{quote}}"
+            r"\begin{document}Body\end{document}",
+        ],
+    )
+    def test_commented_or_escaped_pseudo_definition_is_unchanged(self, content):
+        assert p._mask_definition_environment_tokens(content) == content
+
+    def test_incomplete_definition_is_not_partially_masked(self):
+        content = r"\newenvironment{x}{\begin{quote}}{\end{quote}"
+        assert p._mask_definition_environment_tokens(content) == content
+
+    def test_malformed_braced_command_name_is_not_masked(self):
+        content = r"\newcommand{not-a-command}{\begin{x}}"
+        assert p._mask_definition_environment_tokens(content) == content
+
+    def test_bare_newenvironment_name_is_not_masked(self):
+        content = r"\newenvironment\x{\begin{x}}{\end{x}}"
+        assert p._mask_definition_environment_tokens(content) == content
+
+    def test_masked_definition_does_not_extend_hfill_source_range(
+        self, tmp_path,
+    ):
+        content = (
+            r"\newenvironment{x}{\hfill\begin{minipage}[t]{1in}}"
+            r"{\end{minipage}}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        hfill = p.LatexDocument(source).commands("hfill")[0]
+
+        assert hfill.end <= content.index(r"\begin{minipage}")
+
+    def test_strip_noise_preserves_balanced_minipage_definition(self, tmp_path):
+        content = (
+            r"\newenvironment{dedication}"
+            r"{\hfill\begin{minipage}[t]{1in}\raggedright}"
+            r"{\end{minipage}\clearpage}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert r"\hfill" not in result
+        assert result.count(r"\begin{minipage}") == 1
+        assert result.count(r"\end{minipage}") == 1
+
+
+def test_definition_local_minipage_does_not_make_document_opaque(tmp_path):
+    content = (
+        r"\newenvironment{dedication}"
+        r"{\begin{minipage}[t]{0.66\textwidth}}{\end{minipage}}"
+        r"\title{Book}\author{Author}"
+        r"\begin{document}\begin{proof}Proof prose.\end{proof}\end{document}"
+    )
+    source = p.SourceFile(tmp_path / "main.tex", content)
+    document = p.LatexDocument(source)
+    assert not document.environments("document")[0].opaque
+    assert not document.environments("proof")[0].opaque
+    assert not document.commands("title")[0].opaque
+    assert not document.commands("author")[0].opaque
+
+
 # ── Brace matching ──────────────────────────────────────────────────────────
 
 
@@ -400,6 +578,35 @@ class TestDiscoveryFacts:
 
         assert facts.title == "Line One Learning $F$ Spaces"
         assert facts.authors == ("Alice", "Bob")
+
+    def test_title_drops_layout_declarations_and_publication_note(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\newcommand{\blfootnote}[1]{#1}"
+            r"\title{\Huge \textbf{Mathematical Foundations of Deep Learning}"
+            r"\blfootnote{Draft version. Final version is published elsewhere.}"
+            r"\\ {\LARGE Theory and Algorithms}}"
+        )
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.title == (
+            "Mathematical Foundations of Deep Learning Theory and Algorithms"
+        )
+
+    def test_title_drops_unregistered_blfootnote_argument(self, tmp_path):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\title{Book\blfootnote{Publication note.}\\ Subtitle}"
+        )
+
+        facts = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        ).discovery
+
+        assert facts.title == "Book Subtitle"
 
     def test_nested_macro_definition_is_not_truncated(self, tmp_path):
         main = tmp_path / "main.tex"
@@ -1000,7 +1207,7 @@ class TestInitialPreprocessingPipeline:
 
 class TestCompletePreprocessingPlan:
     expected = [
-        "discover", "simplify_documentclass", "strip_problematic_packages",
+        "discover", "convert_tikz_resources", "simplify_documentclass", "strip_problematic_packages",
         "strip_noise_commands", "strip_annotation_system", "normalize_textsc",
         "convert_pdf_resources", "rewrite_pdf_image_refs", "normalize_citations",
         "preprocess_hyperref", "normalize_table_envs", "unwrap_makecell",
@@ -1009,7 +1216,8 @@ class TestCompletePreprocessingPlan:
         "convert_wrapfigure", "unwrap_subfigures", "destar_floats",
         "replace_ding_commands", "replace_textcircled", "preprocess_theorems",
         "normalize_code_listings", "preprocess_algorithms", "translate",
-        "unnumber_paragraph_headings", "normalize_input_extensions",
+        "unnumber_paragraph_headings", "preserve_appendix_numbering",
+        "normalize_input_extensions",
     ]
 
     def test_declares_every_step_once_in_required_order(self):
@@ -1026,6 +1234,7 @@ class TestCompletePreprocessingPlan:
             step.name: step for step in p.build_preprocessing_plan(False).steps
         }
         compatibility = {
+            "convert_tikz_resources",
             "simplify_documentclass", "strip_problematic_packages",
             "strip_noise_commands", "strip_annotation_system",
             "normalize_textsc", "convert_pdf_resources",
@@ -1038,7 +1247,8 @@ class TestCompletePreprocessingPlan:
             "destar_floats", "replace_ding_commands",
             "replace_textcircled", "preprocess_theorems",
             "normalize_code_listings", "preprocess_algorithms",
-            "unnumber_paragraph_headings", "normalize_input_extensions",
+            "unnumber_paragraph_headings", "preserve_appendix_numbering",
+            "normalize_input_extensions",
         }
         assert by_name["discover"].phase is p.Phase.DISCOVERY
         assert all(
@@ -1046,6 +1256,7 @@ class TestCompletePreprocessingPlan:
             for name in compatibility
         )
         lossy = {
+            "convert_tikz_resources",
             "simplify_documentclass", "strip_problematic_packages",
             "strip_noise_commands", "strip_annotation_system",
             "preprocess_hyperref", "normalize_table_envs",
@@ -1059,6 +1270,29 @@ class TestCompletePreprocessingPlan:
         assert all(by_name[name].safety is p.Safety.LOSSY for name in lossy)
         assert by_name["normalize_citations"].safety is p.Safety.SAFE
         assert by_name["rewrite_pdf_image_refs"].safety is p.Safety.SAFE
+
+    def test_complete_pipeline_preserves_dedication_minipage_boundaries(
+        self, tmp_path,
+    ):
+        main = tmp_path / "main.tex"
+        main.write_text(
+            r"\newenvironment{dedication}"
+            r"{\hfill\begin{minipage}[t]{1in}\raggedright}"
+            r"{\end{minipage}\clearpage}"
+            r"\begin{document}"
+            r"\begin{dedication}For family\end{dedication}"
+            r"\end{document}"
+        )
+        plan = p.build_preprocessing_plan(
+            False,
+            resource_converter=lambda root: p.ResourceResult(frozenset(), ()),
+        )
+
+        result = p.run_preprocessing(tmp_path, main, plan)
+        processed = result.snapshot.sources[main].content
+
+        assert processed.count(r"\begin{minipage}") == 1
+        assert processed.count(r"\end{minipage}") == 1
 
     def test_invalid_dependency_fails_before_any_step_runs(self, tmp_path):
         main = tmp_path / "main.tex"
@@ -1285,7 +1519,7 @@ class TestCompletePreprocessingPlan:
         )
         monkeypatch.setattr(
             p, "_batch_translate",
-            lambda client, glossary, numbered: (
+            lambda client, glossary, numbered, request_limiter=None: (
                 calls.append(dict(numbered))
                 or {index: "Chinese body." for index in numbered}
             ),
@@ -1312,6 +1546,84 @@ class TestCompletePreprocessingPlan:
         assert r"\input{child.tex}" in main.read_text()
         assert main.read_text().count("% paper2epub:translation-begin:") == 1
 
+    def test_real_translation_step_limits_requests_across_files_and_batches(
+        self, tmp_path, monkeypatch
+    ):
+        paragraph = "This English paragraph contains enough words to require translation."
+        main = tmp_path / "main.tex"
+        children = [tmp_path / f"child{index}.tex" for index in range(4)]
+        main.write_text(
+            r"\documentclass{article}\begin{document}"
+            + "\n\n".join([paragraph] * 6)
+            + "".join(rf"\input{{{child.stem}}}" for child in children)
+            + r"\end{document}"
+        )
+        for child in children:
+            child.write_text("\n\n".join([paragraph] * 6))
+
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        state = p.PreprocessingState(snapshot, snapshot.discovery)
+        translate_step = next(
+            step for step in p.build_preprocessing_plan(
+                True, translation_client=object(),
+            ).steps
+            if step.name == "translate"
+        )
+        monkeypatch.setattr(p, "extract_glossary", lambda *args: "")
+        monkeypatch.setattr(p, "_build_heading_translations", lambda *args: {})
+        monkeypatch.setattr(p, "TRANSLATION_BATCH_MAX_CHARS", 1)
+
+        lock = threading.Lock()
+        five_active = threading.Event()
+        overflow = threading.Event()
+        release_requests = threading.Event()
+        active = 0
+        max_active = 0
+
+        def fake_chat(client, system_prompt, user_prompt):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active == p.TRANSLATION_BATCH_WORKERS:
+                    five_active.set()
+                if active > p.TRANSLATION_BATCH_WORKERS:
+                    overflow.set()
+            try:
+                assert release_requests.wait(5)
+                ids = [
+                    line for line in user_prompt.splitlines()
+                    if line.startswith("[") and line.endswith("]")
+                ]
+                return "\n\n".join(f"{item}\nChinese translation." for item in ids)
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr(p, "_chat", fake_chat)
+        errors = []
+
+        def run_translation():
+            try:
+                translate_step.run(state)
+            except BaseException as error:
+                errors.append(error)
+
+        runner = threading.Thread(target=run_translation)
+        runner.start()
+        try:
+            assert five_active.wait(5)
+            assert not overflow.wait(1)
+        finally:
+            release_requests.set()
+            runner.join(10)
+
+        assert not runner.is_alive()
+        assert errors == []
+        assert max_active == p.TRANSLATION_BATCH_WORKERS
+
     def test_translation_preparation_uses_current_snapshot_sources(
         self, tmp_path, monkeypatch,
     ):
@@ -1336,9 +1648,12 @@ class TestCompletePreprocessingPlan:
             assert main.read_text() == original
             return {current_heading: "关于方法"}
 
-        def fake_translate(client, glossary, heading_map, content):
+        def fake_translate(
+            client, glossary, heading_map, content, request_limiter=None,
+        ):
             assert current_heading in content
             assert heading_map == {current_heading: "关于方法"}
+            assert request_limiter is not None
             assert main.read_text() == original
             return p._translate_headings(heading_map, content)
 
@@ -1755,6 +2070,15 @@ class TestFindMatchingBrace:
         assert p.find_matching_brace("{}", 10) is None
 
 
+class TestStripTexComments:
+    def test_removes_comments_but_preserves_newlines_and_escaped_percent(self):
+        content = "before \\% value % note\r\nafter% tail\nend"
+
+        assert p.strip_tex_comments(content) == (
+            "before \\% value \r\nafter\nend"
+        )
+
+
 class TestExtractBraceArg:
     def test_simple(self):
         arg, pos = p.extract_brace_arg("{hello} rest", 0)
@@ -1829,7 +2153,48 @@ class TestHasBalancedBraces:
         assert p._has_balanced_braces(r"$f(x)=\left\{x\right.$")
 
 
+class TestPartitionTranslationBatches:
+    def test_empty_input_has_no_batches(self):
+        assert p._partition_translation_batches({}) == ()
+
+    def test_paragraph_count_does_not_split_batch(self):
+        paragraphs = {i: "x" for i in range(25)}
+
+        assert p._partition_translation_batches(
+            paragraphs,
+            max_chars=100,
+        ) == (paragraphs,)
+
+    def test_default_batch_limit_is_24000_characters(self):
+        paragraphs = {0: "a" * 12_000, 1: "b" * 12_000}
+
+        assert p._partition_translation_batches(paragraphs) == (paragraphs,)
+
+    def test_respects_character_limit(self):
+        assert p._partition_translation_batches(
+            {0: "aaaa", 1: "bbbb", 2: "cc", 3: "ddd"},
+            max_chars=6,
+        ) == ({0: "aaaa"}, {1: "bbbb", 2: "cc"}, {3: "ddd"})
+
+    def test_oversized_paragraph_is_single_batch(self):
+        assert p._partition_translation_batches(
+            {0: "abcdefgh", 1: "x"},
+            max_chars=4,
+        ) == ({0: "abcdefgh"}, {1: "x"})
+
+    @pytest.mark.parametrize("max_chars", [0, -1])
+    def test_rejects_non_positive_limit(self, max_chars):
+        with pytest.raises(ValueError):
+            p._partition_translation_batches(
+                {0: "text"},
+                max_chars=max_chars,
+            )
+
+
 class TestBatchTranslate:
+    def test_empty_input_needs_no_batch_request(self):
+        assert p._batch_translate(object(), "", {}) == {}
+
     def test_retries_only_missing_ids(self, monkeypatch):
         calls = []
         responses = iter(["[0]\n译文零", "[1]\n译文一"])
@@ -1853,13 +2218,80 @@ class TestBatchTranslate:
 
         assert p._batch_translate(object(), "", {0: "source"}) == {0: "正确"}
 
-    def test_raises_when_retry_is_still_incomplete(self, monkeypatch):
+    def test_inline_math_is_protected_and_restored_verbatim(self, monkeypatch):
+        source_math = r"$V(p,t)=G(p)$"
+        prompts = []
+
+        def fake_chat(client, system_prompt, user_prompt):
+            prompts.append(user_prompt)
+            assert source_math not in user_prompt
+            token = re.search(r"⟦P2E_MATH_[^\s]+⟧", user_prompt).group(0)
+            return f"[0]\n对于 {token}，结论成立。"
+
+        monkeypatch.setattr(p, "_chat", fake_chat)
+
+        result = p._batch_translate(
+            object(), "", {0: f"For {source_math}, the conclusion holds."}
+        )
+
+        assert result == {0: f"对于 {source_math}，结论成立。"}
+        assert len(prompts) == 1
+
+    def test_retries_when_math_placeholder_is_missing(self, monkeypatch):
+        responses = []
+
+        def fake_chat(client, system_prompt, user_prompt):
+            token = re.search(r"⟦P2E_MATH_[^\s]+⟧", user_prompt).group(0)
+            responses.append(token)
+            if len(responses) == 1:
+                return "[0]\n公式被丢弃。"
+            return f"[0]\n保留公式 {token}。"
+
+        monkeypatch.setattr(p, "_chat", fake_chat)
+
+        result = p._batch_translate(
+            object(), "", {0: r"An inline formula $f(x)=x^2$ is retained."}
+        )
+
+        assert result == {0: r"保留公式 $f(x)=x^2$。"}
+        assert len(responses) == 2
+
+    def test_skips_persistent_math_placeholder_loss(
+        self, monkeypatch, capsys,
+    ):
+        monkeypatch.setattr(p, "_chat", lambda *args: "[0]\n公式被丢弃。")
+
+        result = p._batch_translate(
+            object(), "", {0: r"An inline formula $f(x)=x^2$ is retained."}
+        )
+
+        assert result == {}
+        assert "skipped invalid paragraph IDs: 0" in capsys.readouterr().err
+
+    def test_allows_safe_reordering_of_math_placeholders(self, monkeypatch):
+        def fake_chat(client, system_prompt, user_prompt):
+            tokens = re.findall(r"⟦P2E_MATH_[^\s]+⟧", user_prompt)
+            return f"[0]\n{tokens[1]} 与 {tokens[0]}"
+
+        monkeypatch.setattr(p, "_chat", fake_chat)
+
+        result = p._batch_translate(
+            object(), "", {0: r"Compare $f(x)$ with $g(x)$."}
+        )
+
+        assert result == {0: r"$g(x)$ 与 $f(x)$"}
+
+    def test_skips_when_retry_is_still_incomplete(
+        self, monkeypatch, capsys,
+    ):
         monkeypatch.setattr(p, "_chat", lambda *args: "")
 
-        with pytest.raises(RuntimeError, match="0"):
-            p._batch_translate(object(), "", {0: "source"})
+        assert p._batch_translate(object(), "", {0: "source"}) == {}
+        assert "0 (missing response)" in capsys.readouterr().err
 
-    def test_retry_transport_error_reports_affected_ids(self, monkeypatch):
+    def test_retry_transport_error_skips_affected_ids(
+        self, monkeypatch, capsys,
+    ):
         responses = iter([{0: "译文零"}, RuntimeError("request failed")])
 
         def fake_request(*args):
@@ -1870,8 +2302,171 @@ class TestBatchTranslate:
 
         monkeypatch.setattr(p, "_request_numbered_translation", fake_request)
 
-        with pytest.raises(RuntimeError, match="1"):
-            p._batch_translate(object(), "", {0: "zero", 1: "one"})
+        result = p._batch_translate(object(), "", {0: "zero", 1: "one"})
+
+        assert result == {0: "译文零"}
+        assert "skipped paragraph IDs: 1" in capsys.readouterr().err
+
+    def test_overlapping_batches_merge_in_input_order(self, monkeypatch):
+        zero_started = threading.Event()
+        one_started = threading.Event()
+        one_completed = threading.Event()
+        completion_order = []
+
+        def translate(client, prompt, batch):
+            if 0 in batch:
+                zero_started.set()
+                assert one_started.wait(2)
+                assert one_completed.wait(2)
+            else:
+                one_started.set()
+                assert zero_started.wait(2)
+                completion_order.append(1)
+                one_completed.set()
+                return {1: "zh-1"}
+            completion_order.append(0)
+            return {index: f"zh-{index}" for index in batch}
+
+        monkeypatch.setattr(p, "_translate_numbered_batch", translate)
+        monkeypatch.setattr(p, "TRANSLATION_BATCH_MAX_CHARS", 1)
+
+        result = p._batch_translate(object(), "", {0: "a", 1: "b"})
+
+        assert completion_order == [1, 0]
+        assert result == {
+            0: "zh-0",
+            1: "zh-1",
+        }
+        assert list(result) == [0, 1]
+
+    def test_partial_batch_fallback_preserves_successful_translations(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(p, "TRANSLATION_BATCH_MAX_CHARS", 1)
+        monkeypatch.setattr(
+            p,
+            "_translate_numbered_batch",
+            lambda client, prompt, batch: (
+                {} if 1 in batch else {index: f"zh-{index}" for index in batch}
+            ),
+        )
+
+        result = p._batch_translate(
+            object(), "", {0: "zero", 1: "one", 2: "two"}
+        )
+
+        assert result == {0: "zh-0", 2: "zh-2"}
+
+    def test_retries_missing_and_unbalanced_ids_within_each_batch(
+        self, monkeypatch
+    ):
+        first_requests = threading.Barrier(2)
+        calls = []
+        calls_lock = threading.Lock()
+
+        def fake_chat(client, system_prompt, user_prompt):
+            ids = tuple(
+                int(line[1:-1])
+                for line in user_prompt.splitlines()
+                if line.startswith("[") and line.endswith("]")
+            )
+            with calls_lock:
+                calls.append(ids)
+            if len(ids) == 2:
+                first_requests.wait(timeout=2)
+            return {
+                (0, 1): "[0]\n译文零",
+                (1,): "[1]\n译文一",
+                (2, 3): "[2]\n错误}\n\n[3]\n译文三",
+                (2,): "[2]\n译文二",
+            }[ids]
+
+        monkeypatch.setattr(p, "_chat", fake_chat)
+        monkeypatch.setattr(p, "TRANSLATION_BATCH_MAX_CHARS", 8)
+
+        result = p._batch_translate(
+            object(), "", {0: "zero", 1: "one", 2: "two", 3: "three"}
+        )
+
+        assert result == {0: "译文零", 1: "译文一", 2: "译文二", 3: "译文三"}
+        assert sorted(calls) == [(0, 1), (1,), (2,), (2, 3)]
+
+    def test_cancels_batches_that_remain_queued_after_failure(
+        self, monkeypatch
+    ):
+        real_executor = p.ThreadPoolExecutor
+        active_workers = threading.Barrier(2)
+        cancellation_complete = threading.Event()
+        started = []
+        cancelled = []
+        observations_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        class TrackingExecutor(real_executor):
+            def submit(self, fn, client, prompt, batch):
+                batch_id = next(iter(batch))
+                future = super().submit(fn, client, prompt, batch)
+                original_cancel = future.cancel
+
+                def track_cancel():
+                    was_cancelled = original_cancel()
+                    if was_cancelled:
+                        with observations_lock:
+                            cancelled.append(batch_id)
+                    if batch_id == 4:
+                        cancellation_complete.set()
+                    return was_cancelled
+
+                future.cancel = track_cancel
+                return future
+
+        def translate(client, prompt, batch):
+            nonlocal active, max_active
+            batch_id = next(iter(batch))
+            with observations_lock:
+                started.append(batch_id)
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                if batch_id == 0:
+                    active_workers.wait(timeout=2)
+                    raise RuntimeError("broken batch")
+                if batch_id == 1:
+                    active_workers.wait(timeout=2)
+                assert cancellation_complete.wait(2)
+                return {batch_id: f"zh-{batch_id}"}
+            finally:
+                with observations_lock:
+                    active -= 1
+
+        monkeypatch.setattr(p, "ThreadPoolExecutor", TrackingExecutor)
+        monkeypatch.setattr(p, "_translate_numbered_batch", translate)
+        monkeypatch.setattr(p, "TRANSLATION_BATCH_MAX_CHARS", 1)
+        monkeypatch.setattr(p, "TRANSLATION_BATCH_WORKERS", 2)
+
+        with pytest.raises(RuntimeError, match="broken batch"):
+            p._batch_translate(
+                object(), "", {index: str(index) for index in range(5)}
+            )
+
+        assert cancelled
+        assert set(cancelled).isdisjoint(started)
+        assert set(cancelled) | set(started) == set(range(5))
+        assert max_active == 2
+        assert max_active <= p.TRANSLATION_BATCH_WORKERS
+
+    def test_propagates_batch_failure(self, monkeypatch):
+        def translate(client, prompt, batch):
+            if 1 in batch:
+                raise RuntimeError("broken batch")
+            return {index: f"zh-{index}" for index in batch}
+
+        monkeypatch.setattr(p, "_translate_numbered_batch", translate)
+        monkeypatch.setattr(p, "TRANSLATION_BATCH_MAX_CHARS", 1)
+
+        with pytest.raises(RuntimeError, match="broken batch"):
+            p._batch_translate(object(), "", {0: "a", 1: "b"})
 
 
 # ── Title & Author extraction ──────────────────────────────────────────────
@@ -2077,6 +2672,51 @@ class TestStripNoisePlanner:
         source = p.SourceFile(tmp_path / "main.tex", content)
         outcome = p.plan_strip_noise(source, p.LatexDocument(source))
         assert p.EditPlanner.apply(source, outcome.edits) == "Before  After"
+
+    def test_removes_tiny_font_declaration_from_math(self, tmp_path):
+        content = (
+            r"\newenvironment{dedication}"
+            r"{\begin{minipage}}{\end{minipage}}"
+            r"\begin{document}$p_{\tiny{R}}(\cdot\mid x,u)$\end{document}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        document = p.LatexDocument(source)
+
+        tiny = document.commands("tiny")[0]
+        assert tiny.complete
+        assert not tiny.opaque
+
+        outcome = p.plan_strip_noise(source, document)
+
+        result = p.EditPlanner.apply(source, outcome.edits)
+        assert result == content.replace(r"\tiny", "", 1)
+
+    def test_tiny_inside_removed_environment_does_not_overlap(self, tmp_path):
+        content = r"A\begin{tikzpicture}\tiny x\end{tikzpicture}Z"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == "AZ"
+
+    def test_tiny_inside_removed_command_does_not_overlap(self, tmp_path):
+        content = r"A\marginpar{\tiny x}Z"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == "AZ"
+
+    @pytest.mark.parametrize("command", ["newcommand", "renewcommand"])
+    def test_preserves_tiny_as_macro_definition_name(
+        self, tmp_path, command,
+    ):
+        content = rf"\{command}{{\tiny}}{{custom}}"
+        source = p.SourceFile(tmp_path / "main.tex", content)
+
+        outcome = p.plan_strip_noise(source, p.LatexDocument(source))
+
+        assert p.EditPlanner.apply(source, outcome.edits) == content
 
     def test_incomplete_two_argument_noise_command_is_preserved(self, tmp_path):
         content = r"Before \setlength{\parindent} After"
@@ -2900,6 +3540,12 @@ class TestExtractSectionHeadings:
 
         assert self.extract(tmp_path, tex) == [r"About \textbf{Method}"]
 
+    def test_includes_chapter_title(self, tmp_path):
+        tex = tmp_path / "chapter.tex"
+        tex.write_text(r"\chapter{Deep Reinforcement Learning}")
+
+        assert self.extract(tmp_path, tex) == ["Deep Reinforcement Learning"]
+
     def test_excludes_headings_inside_translation_skip_environment(self, tmp_path):
         tex = tmp_path / "section.tex"
         tex.write_text(
@@ -2935,6 +3581,36 @@ class TestTranslateHeadings:
         result = p._translate_headings({"Intro": "引言"}, content)
 
         assert r"\label{sec:{nested}}" + "\n\n引言\n" in result
+
+    def test_chapter_translation_is_plain_text_after_label(self):
+        content = (
+            r"\chapter{Deep Reinforcement Learning}\label{chpt:rl}"
+            "\nBody text."
+        )
+
+        result = p._translate_headings(
+            {"Deep Reinforcement Learning": "深度强化学习"}, content,
+        )
+
+        assert result.count(r"\chapter") == 1
+        assert r"\chapter{深度强化学习}" not in result
+        assert r"\label{chpt:rl}" + "\n\n深度强化学习\n" in result
+
+    def test_comment_between_heading_and_label_keeps_label_attached(self):
+        content = (
+            r"\subsection{Euler--Lagrange Equations}"
+            "\n% source note\n"
+            r"\label{subsec:oc-el}"
+            "\nBody text."
+        )
+
+        result = p._translate_headings(
+            {"Euler--Lagrange Equations": "欧拉-拉格朗日方程"}, content,
+        )
+
+        assert result.index(r"\label{subsec:oc-el}") < result.index(
+            "欧拉-拉格朗日方程"
+        )
 
     def test_does_not_insert_inside_translation_skip_environment(self):
         content = (
@@ -2981,7 +3657,297 @@ def test_crlf_paragraph_translation_preserves_separators_and_is_idempotent(
     assert second == first
 
 
+class TestTranslationProjectionRanges:
+    def test_removes_boundaries_label_and_keeps_prose(self):
+        content = (
+            r"\begin{proof}\label{proof:one}" + "\n"
+            "Proof prose has enough English words for translation.\n"
+            r"\end{proof}"
+        )
+        source = p.SourceFile(Path("main.tex"), content)
+
+        ranges = p._translation_projection_ranges(
+            content, p.LatexDocument(source), (),
+        )
+        projected = p._slice_without_ranges(
+            content, 0, len(content), ranges,
+        )
+
+        assert r"\begin{proof}" not in projected
+        assert r"\end{proof}" not in projected
+        assert r"\label{proof:one}" not in projected
+        assert "Proof prose" in projected
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_removes_comment_separated_begin_and_end_boundaries(self, newline):
+        content = (
+            rf"\begin% begin note{newline}{{proof}}" + newline
+            + "Proof prose has enough English words for translation."
+            + newline + rf"\end% end note{newline}{{proof}}"
+        )
+        source = p.SourceFile(Path("main.tex"), content)
+
+        ranges = p._translation_projection_ranges(
+            content, p.LatexDocument(source), (),
+        )
+        projected = p._slice_without_ranges(
+            content, 0, len(content), ranges,
+        )
+
+        assert r"\begin% begin note" not in projected
+        assert r"\end% end note" not in projected
+        assert "Proof prose" in projected
+
+    def test_removes_environment_like_token_inside_comment(self):
+        content = (
+            "% ignored " + r"\begin% note" + "\n"
+            "{proof}\n"
+            "Visible prose has enough English words for translation."
+        )
+        source = p.SourceFile(Path("main.tex"), content)
+
+        ranges = p._translation_projection_ranges(
+            content, p.LatexDocument(source), (),
+        )
+        projected = p._slice_without_ranges(
+            content, 0, len(content), ranges,
+        )
+
+        assert r"\begin% note" not in projected
+        assert "Visible prose has enough English words" in projected
+
+
+class TestMergeRanges:
+    def test_merges_touching_nested_and_overlapping_ranges(self):
+        assert p._merge_ranges(
+            [(8, 12), (1, 4), (3, 6), (9, 10), (6, 8)],
+        ) == ((1, 12),)
+
+    def test_discards_empty_and_preserves_disjoint_ranges(self):
+        assert p._merge_ranges(
+            [(5, 5), (9, 7), (6, 8), (1, 3)],
+        ) == ((1, 3), (6, 8))
+
+
+@pytest.mark.parametrize("environment", ["proof", "example", "theorem"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multparagraph_translation_never_duplicates_wrappers(
+    monkeypatch, environment, newline,
+):
+    content = (
+        f"\\begin{{{environment}}}{newline}"
+        "First paragraph has enough English prose to translate."
+        f"{newline}{newline}"
+        "Second paragraph also has enough English prose to translate."
+        f"{newline}\\end{{{environment}}}"
+    )
+    payloads = []
+    monkeypatch.setattr(
+        p,
+        "_batch_translate",
+        lambda client, glossary, numbered: (
+            payloads.extend(numbered.values())
+            or {index: f"Chinese {index}." for index in numbered}
+        ),
+    )
+
+    result = p.translate_file_content(object(), "", {}, content)
+
+    assert all(
+        r"\begin{" not in text and r"\end{" not in text
+        for text in payloads
+    )
+    assert result.count(f"\\begin{{{environment}}}") == 1
+    assert result.count(f"\\end{{{environment}}}") == 1
+    if newline == "\r\n":
+        assert "\n" not in result.replace("\r\n", "")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_comment_separated_boundaries_never_enter_translation_payload(
+    monkeypatch, newline,
+):
+    content = (
+        rf"\begin% begin note{newline}{{proof}}" + newline
+        + "First paragraph has enough English prose to translate."
+        + newline + newline
+        + "Second paragraph also has enough English prose to translate."
+        + newline + rf"\end% end note{newline}{{proof}}"
+    )
+    payloads = []
+    monkeypatch.setattr(
+        p,
+        "_batch_translate",
+        lambda client, glossary, numbered: (
+            payloads.extend(numbered.values())
+            or {index: f"Chinese {index}." for index in numbered}
+        ),
+    )
+
+    result = p.translate_file_content(object(), "", {}, content)
+
+    assert payloads
+    assert all(
+        r"\begin% begin note" not in text
+        and r"\end% end note" not in text
+        for text in payloads
+    )
+    assert result.count(r"\begin% begin note") == 1
+    assert result.count(r"\end% end note") == 1
+    if newline == "\r\n":
+        assert "\n" not in result.replace("\r\n", "")
+
+
 class TestTranslateFileContent:
+    def test_skipped_invalid_translation_preserves_source_without_marker(
+        self, monkeypatch,
+    ):
+        content = "English prose has enough words to require translation."
+        monkeypatch.setattr(p, "_batch_translate", lambda *args: {})
+
+        result = p.translate_file_content(object(), "", {}, content)
+
+        assert result == content
+        assert "% paper2epub:translation-begin:" not in result
+
+    def test_tex_comment_noise_is_removed_from_translation_payload(
+        self, monkeypatch,
+    ):
+        content = "%\nFurthermore, we define the following useful quantity.\n%"
+        payloads = []
+        monkeypatch.setattr(
+            p,
+            "_batch_translate",
+            lambda client, glossary, numbered: (
+                payloads.extend(numbered.values())
+                or {index: "此外，我们定义如下有用的量。" for index in numbered}
+            ),
+        )
+
+        result = p.translate_file_content(object(), "", {}, content)
+
+        assert payloads == ["Furthermore, we define the following useful quantity."]
+        assert "此外，我们定义" in result
+        assert result.count("%") >= 3
+
+    def test_incomplete_display_math_is_opaque_to_translation(self, monkeypatch):
+        prose = "Introductory prose has enough English words for translation."
+        content = prose + "\n" + r"\[unfinished x + y"
+        payloads = []
+        monkeypatch.setattr(
+            p,
+            "_batch_translate",
+            lambda client, glossary, numbered: (
+                payloads.extend(numbered.values())
+                or {index: "中文引言。" for index in numbered}
+            ),
+        )
+
+        result = p.translate_file_content(object(), "", {}, content)
+
+        assert payloads == [prose]
+        assert result.endswith(r"\[unfinished x + y")
+        assert result.index("中文引言。") < result.index(r"\[")
+
+    def test_display_math_is_shared_and_translation_stays_outside_math(
+        self, monkeypatch,
+    ):
+        prose = (
+            "For any $p \\in P$ and $t \\in [0,T)$, we consider the evolution "
+            "given by"
+        )
+        display = (
+            "\\[\n"
+            "\\begin{cases}\n"
+            "  \\partial_s \\rho_s + \\nabla \\cdot(w \\rho_s)=0, \\\\\n"
+            "  \\rho_t=p.\n"
+            "\\end{cases}\n"
+            "\\]"
+        )
+        content = prose + "\n" + display + "\nFollowing explanatory prose."
+        payloads = []
+
+        def translate(client, glossary, numbered):
+            payloads.extend(numbered.values())
+            return {
+                index: "对任意参数，我们考虑下列演化。"
+                for index in numbered
+            }
+
+        monkeypatch.setattr(p, "_batch_translate", translate)
+
+        result = p.translate_file_content(object(), "", {}, content)
+
+        assert payloads == [prose, "Following explanatory prose."]
+        assert all(
+            r"\[" not in payload and r"\]" not in payload
+            for payload in payloads
+        )
+        assert result.count(r"\[") == 1
+        assert result.count(r"\]") == 1
+        assert result.count(r"\begin{cases}") == 1
+        assert result.index("对任意参数") < result.index(r"\[")
+        begin = result.index("% paper2epub:translation-begin:")
+        end = result.index("% paper2epub:translation-end:")
+        assert end < result.index(r"\[")
+        assert r"\[" not in result[begin:end]
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_list_intro_and_items_translate_at_their_own_boundaries(
+        self, monkeypatch, newline,
+    ):
+        intro = "Introductory prose has enough English words for translation."
+        first = "First list item has enough English words for translation."
+        second = "Second list item has enough English words for translation."
+        content = newline.join((
+            intro,
+            "% source note",
+            r"\begin{enumerate}",
+            "% source note",
+            rf"\item {first}",
+            "% source note",
+            rf"\item {second}",
+            r"\end{enumerate}",
+        ))
+        calls = []
+
+        def translate(_client, _glossary, numbered, _limiter=None):
+            calls.append(dict(numbered))
+            translated = {}
+            for index, paragraph in numbered.items():
+                if intro in paragraph:
+                    translated[index] = "中文引言。"
+                elif first in paragraph:
+                    translated[index] = "中文第一项。"
+                elif second in paragraph:
+                    translated[index] = "中文第二项。"
+            return translated
+
+        monkeypatch.setattr(p, "_batch_translate", translate)
+
+        result = p.translate_file_content(object(), "", {}, content)
+        repeated = p.translate_file_content(object(), "", {}, result)
+
+        payloads = tuple(calls[0].values())
+        assert len(payloads) == 3
+        assert all(r"\item" not in payload for payload in payloads)
+        assert all(r"\begin" not in payload for payload in payloads)
+        assert all(r"\end" not in payload for payload in payloads)
+        assert result.count(r"\item") == 2
+        assert result.index("中文引言。") < result.index(r"\begin{enumerate}")
+        assert (
+            result.index(first)
+            < result.index("中文第一项。")
+            < result.index(r"\item " + second)
+        )
+        assert (
+            result.index(second)
+            < result.index("中文第二项。")
+            < result.index(r"\end{enumerate}")
+        )
+        assert repeated == result
+        assert len(calls) == 1
+
     def test_paragraph_heading_is_not_duplicated(self, monkeypatch):
         content = r"\paragraph{Contributions.}" + "\nBody text with enough prose."
         monkeypatch.setattr(
@@ -3225,6 +4191,33 @@ class TestStripHeadingLines:
         assert p._strip_heading_lines(text) == "Body text."
 
 
+class TestUniqueLexicalDocumentBodyRange:
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            (r"PRE\begin{document}BODY\end{document}POST", (19, 23)),
+            (r"\begin{document}BODY", None),
+            (r"BODY\end{document}", None),
+            (r"\end{document}BODY\begin{document}", None),
+            (
+                r"\begin{document}\begin{document}BODY\end{document}",
+                None,
+            ),
+            (
+                r"\begin{document}BODY\end{document}\end{document}",
+                None,
+            ),
+            (
+                r"\begin{document}ONE\end{document}"
+                r"\begin{document}TWO\end{document}",
+                None,
+            ),
+        ],
+    )
+    def test_requires_one_ordered_pair(self, content, expected):
+        assert p._unique_lexical_document_body_range(content) == expected
+
+
 class TestTranslationBarrier:
     @staticmethod
     def snapshot(tmp_path, main_content, child_content=None):
@@ -3289,6 +4282,57 @@ class TestTranslationBarrier:
             r"\documentclass{article}\begin{document}"
             r"Main prose.\input{child}\end{document}"
         )
+
+    def test_opaque_main_document_uses_unique_lexical_boundaries(self, tmp_path):
+        content = (
+            "\\documentclass[12pt\n"
+            r"\newcommand\blfootnote[1]{#1}"
+            r"\begin{document}Main prose.\end{document}"
+        )
+        main, snapshot = self.snapshot(tmp_path, content)
+        document = snapshot.documents[main]
+        document_ref = document.environments("document")[0]
+        seen = []
+
+        assert document_ref.opaque
+
+        result = p.TranslationBarrier(
+            lambda source, discovery: seen.append(source.content) or (
+                source.content + " translated"
+            ),
+            max_workers=1,
+        ).run(snapshot)
+
+        assert seen == ["Main prose."]
+        assert result.snapshot.sources[main].content == content.replace(
+            "Main prose.", "Main prose. translated",
+        )
+        assert [diagnostic.code for diagnostic in result.diagnostics] == [
+            "lexical-document-boundary-fallback",
+        ]
+
+    def test_foreign_main_document_does_not_use_lexical_fallback(self, tmp_path):
+        content = r"\begin{document}Main prose.\end{document}"
+        main, snapshot = self.snapshot(tmp_path, content)
+        document = snapshot.documents[main]
+        document_ref = document.environments("document")[0]
+        document._refs = tuple(
+            p.replace(ref, file=tmp_path / "other.tex")
+            if ref is document_ref else ref
+            for ref in document._refs
+        )
+        calls = []
+
+        result = p.TranslationBarrier(
+            lambda source, discovery: calls.append(source.path) or "changed",
+            max_workers=1,
+        ).run(snapshot)
+
+        assert calls == []
+        assert result.snapshot is snapshot
+        assert [diagnostic.code for diagnostic in result.diagnostics] == [
+            "foreign-reference",
+        ]
 
     def test_incomplete_main_document_is_preserved_with_diagnostic(self, tmp_path):
         content = r"\begin{document}Unfinished main prose."
@@ -3993,6 +5037,90 @@ class TestParagraphUnnumberingPipeline:
         assert '<h4 class="unnumbered"' in result.stdout
 
 
+class TestPreserveAppendixNumbering:
+    @staticmethod
+    def plan(tmp_path, content):
+        main = tmp_path / "main.tex"
+        main.write_text(content)
+        snapshot = p.build_discovery_facts(
+            p.DocumentSnapshot.from_directory(tmp_path, main)
+        )
+        outcome = p.plan_preserve_appendix_numbering(snapshot)
+        return snapshot.sources[main], outcome
+
+    def test_preserves_book_appendix_letters_and_order(self, tmp_path):
+        source, outcome = self.plan(
+            tmp_path,
+            r"\chapter{Main}\section{First}"
+            r"\appendix"
+            r"\chapter{Extra}\section{More}\subsection{Detail}"
+            r"\chapter{Other}\section{Last}",
+        )
+
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert result == (
+            r"\chapter{Main}\section{First}"
+            r"\chapter*{A Extra}\section*{A.1 More}"
+            r"\subsection*{A.1.1 Detail}"
+            r"\chapter*{B Other}\section*{B.1 Last}"
+        )
+        assert all(edit.safety is p.Safety.SAFE for edit in outcome.edits)
+
+    def test_preserves_article_appendix_letters(self, tmp_path):
+        source, outcome = self.plan(
+            tmp_path,
+            r"\section{Main}\appendix"
+            r"\section[Extra short]{Extra}\subsection{More}",
+        )
+
+        result = p.EditPlanner.apply(source, outcome.edits)
+
+        assert result == (
+            r"\section{Main}"
+            r"\section*[A Extra short]{A Extra}"
+            r"\subsection*{A.1 More}"
+        )
+
+    def test_incomplete_appendix_heading_is_preserved(self, tmp_path):
+        source, outcome = self.plan(
+            tmp_path, r"\appendix\chapter{Incomplete",
+        )
+
+        assert p.EditPlanner.apply(source, outcome.edits) == source.content
+
+    @pytest.mark.skipif(shutil.which("pandoc") is None, reason="pandoc not installed")
+    def test_pandoc_keeps_main_numbers_and_explicit_appendix_letters(
+        self, tmp_path,
+    ):
+        source, outcome = self.plan(
+            tmp_path,
+            r"\chapter{Main}\section{First}"
+            r"See Appendix \ref{app:more}."
+            r"\appendix\chapter{Extra}"
+            r"\section{More}\label{app:more}",
+        )
+        transformed = p.EditPlanner.apply(source, outcome.edits)
+
+        result = subprocess.run(
+            [
+                "pandoc", "--from=latex", "--to=html5", "--number-sections",
+                f"--lua-filter={p.SCRIPT_DIR / 'filter.lua'}",
+            ],
+            input=transformed,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        assert 'class="header-section-number">1</span> Main' in result.stdout
+        assert ">A Extra</h1>" in result.stdout
+        assert ">A.1 More</h2>" in result.stdout
+        assert '>A.1</a>' in result.stdout
+        assert "[app:more]" not in result.stdout
+        assert result.stdout.index("Main") < result.stdout.index("A Extra")
+
+
 # ── get_input_order ─────────────────────────────────────────────────────────
 
 
@@ -4137,6 +5265,72 @@ class TestReferencePassDependencies:
         assert "discover" in by_name["normalize_input_extensions"].after
         assert "translate" in by_name["normalize_input_extensions"].after
         assert all(spec.idempotent for spec in specs)
+
+
+class TestReplaceTikzFigure:
+    def test_replaces_tikz_body_and_preserves_outer_caption(self, tmp_path):
+        content = (
+            r"\begin{figure}"
+            r"\begin{subfigure}{.4\textwidth}"
+            r"\begin{tikzpicture}A\end{tikzpicture}"
+            r"\caption{First panel}\label{fig:first}\end{subfigure}"
+            r"\begin{subfigure}{.4\textwidth}"
+            r"\begin{tikzpicture}B\end{tikzpicture}"
+            r"\caption{Second panel}\label{fig:second}\end{subfigure}"
+            r"\caption{Whole figure}\label{fig:whole}"
+            r"\end{figure}"
+        )
+        source = p.SourceFile(tmp_path / "main.tex", content)
+        document = p.LatexDocument(source)
+        outcome = p.plan_replace_tikz_figure(
+            source,
+            document,
+            document.environments("figure")[0],
+            "paper2epub-figures/tikz-001.png",
+        )
+
+        assert len(outcome.edits) == 1
+        assert outcome.edits[0].safety is p.Safety.LOSSY
+        result = p.EditPlanner.apply(source, outcome.edits)
+        assert "tikzpicture" not in result
+        assert "First panel" not in result
+        assert "Second panel" not in result
+        assert (
+            r"\includegraphics[width=\linewidth]"
+            r"{paper2epub-figures/tikz-001.png}"
+        ) in result
+        image_end = result.index("tikz-001.png}") + len("tikz-001.png}")
+        first_label = result.index(r"\label{fig:first}")
+        second_label = result.index(r"\label{fig:second}")
+        outer_caption = result.index(r"\caption{Whole figure}")
+        assert image_end < first_label < second_label < outer_caption
+        assert result.count(r"\label{fig:whole}") == 1
+        assert r"\caption{Whole figure}\label{fig:whole}" in result
+
+        rewritten = p.SourceFile(source.path, result)
+        second = p.plan_replace_tikz_figure(
+            rewritten,
+            p.LatexDocument(rewritten),
+            p.LatexDocument(rewritten).environments("figure")[0],
+            "paper2epub-figures/tikz-001.png",
+        )
+        assert second.edits == ()
+
+    def test_non_tikz_figure_is_unchanged(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "main.tex",
+            r"\begin{figure}\includegraphics{plot.png}\end{figure}",
+        )
+        document = p.LatexDocument(source)
+
+        outcome = p.plan_replace_tikz_figure(
+            source,
+            document,
+            document.environments("figure")[0],
+            "unused.png",
+        )
+
+        assert outcome.edits == ()
 
 
 # ── extract_abstract ────────────────────────────────────────────────────────
@@ -4390,8 +5584,340 @@ class TestPlanCodeListings:
 
 
 class TestEpubCss:
+    def test_toc_rule_suppresses_ordered_list_markers(self):
+        css = (Path(p.__file__).resolve().parent / "epub.css").read_text()
+        toc_rule = css.split("\nol.toc {\n", 1)[1].split("\n}", 1)[0]
+
+        assert "list-style-type: none !important;" in toc_rule
+
     def test_pre_rule_explicitly_left_aligns_block_code(self):
         css = (Path(p.__file__).resolve().parent / "epub.css").read_text()
         pre_rule = css.split("\npre {\n", 1)[1].split("\n}", 1)[0]
 
         assert "text-align: left;" in pre_rule
+
+    def test_equation_number_is_positioned_at_the_right_edge(self):
+        css = (Path(p.__file__).resolve().parent / "epub.css").read_text()
+        wrapper_rule = css.split("\n.numbered-equation {\n", 1)[1].split(
+            "\n}", 1,
+        )[0]
+        number_rule = css.split("\n.equation-number {\n", 1)[1].split(
+            "\n}", 1,
+        )[0]
+
+        assert "position: relative;" in wrapper_rule
+        assert "position: absolute;" in number_rule
+        assert "right: 0;" in number_rule
+
+
+@pytest.mark.skipif(shutil.which("pandoc") is None, reason="pandoc is required")
+class TestPandocFilter:
+    @staticmethod
+    def render_html(
+        tmp_path,
+        content,
+        *,
+        numbering_scope="global",
+        subequations="",
+    ):
+        tex = tmp_path / "equations.tex"
+        tex.write_text(content)
+        return subprocess.run(
+            [
+                "pandoc",
+                str(tex),
+                "--from",
+                "latex",
+                "--to",
+                "html5",
+                "--mathml",
+                "--metadata",
+                f"paper2epub-numbering-scope={numbering_scope}",
+                "--metadata",
+                f"paper2epub-subequations={subequations}",
+                f"--lua-filter={p.SCRIPT_DIR / 'filter.lua'}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    def test_numbers_and_links_book_equations_within_chapters(self, tmp_path):
+        html = self.render_html(
+            tmp_path,
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\chapter{First}"
+            r"\begin{equation*}z=0\end{equation*}"
+            r"\begin{equation}\label{eq:first}x=1\end{equation}"
+            r"In \eqref{eq:first}."
+            r"\chapter{Second}"
+            r"\begin{equation}\label{eq:second}y=2\end{equation}"
+            r"In \eqref{eq:second}."
+            r"\end{document}",
+            numbering_scope="chapter",
+        )
+
+        assert re.search(r'id="eq:first"\s+class="numbered-equation"', html)
+        assert re.search(r'id="eq:second"\s+class="numbered-equation"', html)
+        assert html.count('class="equation-number">(1.1)</span>') == 1
+        assert html.count('class="equation-number">(2.1)</span>') == 1
+        assert '<a href="#eq:first"' in html
+        assert 'data-reference="eq:first">(1.1)</a>' in html
+        assert 'data-reference="eq:second">(2.1)</a>' in html
+
+    def test_keeps_article_equation_numbers_global(self, tmp_path):
+        html = self.render_html(
+            tmp_path,
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\section{First}"
+            r"\begin{equation}\label{eq:first}x=1\end{equation}"
+            r"\begin{figure}\includegraphics{first.png}"
+            r"\caption{First figure}\label{fig:first}\end{figure}"
+            r"\begin{table}\begin{tabular}{c}A\end{tabular}"
+            r"\caption{First table}\label{tab:first}\end{table}"
+            r"In \eqref{eq:first}."
+            r"\section{Second}"
+            r"\begin{equation}\label{eq:second}y=2\end{equation}"
+            r"\begin{figure}\includegraphics{second.png}"
+            r"\caption{Second figure}\label{fig:second}\end{figure}"
+            r"\begin{table}\begin{tabular}{c}B\end{tabular}"
+            r"\caption{Second table}\label{tab:second}\end{table}"
+            r"In \eqref{eq:second}."
+            r"\end{document}",
+        )
+
+        assert html.count('class="equation-number">(1)</span>') == 1
+        assert html.count('class="equation-number">(2)</span>') == 1
+        assert 'data-reference="eq:first">(1)</a>' in html
+        assert 'data-reference="eq:second">(2)</a>' in html
+        assert "Figure 1:" in html
+        assert "Figure 2:" in html
+        assert "Table 1:" in html
+        assert "Table 2:" in html
+
+    def test_subequations_share_one_parent_counter(self, tmp_path):
+        html = self.render_html(
+            tmp_path,
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\chapter{First}"
+            r"\begin{equation}\label{eq:first}x=1\end{equation}"
+            r"\begin{align}"
+            r"a&=1\label{subeq:a}\\"
+            r"b&=2\label{subeq:b}"
+            r"\end{align}"
+            r"See \eqref{eq:pair}, \eqref{subeq:a}, and \eqref{subeq:b}."
+            r"\begin{equation}\label{eq:after}y=2\end{equation}"
+            r"See \eqref{eq:after}."
+            r"\end{document}",
+            numbering_scope="chapter",
+            subequations="eq:pair|subeq:a|subeq:b",
+        )
+
+        assert 'data-reference="eq:pair">(1.2)</a>' in html
+        assert 'data-reference="subeq:a">(1.2a)</a>' in html
+        assert 'data-reference="subeq:b">(1.2b)</a>' in html
+        assert 'data-reference="eq:after">(1.3)</a>' in html
+        assert 'id="eq:pair"' in html
+        assert 'id="subeq:a"' in html
+        assert 'id="subeq:b"' in html
+
+    def test_numbers_figures_and_tables_within_chapters(self, tmp_path):
+        html = self.render_html(
+            tmp_path,
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\chapter{First}"
+            r"\begin{equation}\label{eq:first}x=1\end{equation}"
+            r"\begin{figure}\includegraphics{first.png}\label{fig:first-a}"
+            r"\caption{First figure}\label{fig:first}\end{figure}"
+            r"\begin{table}\begin{tabular}{c}A\end{tabular}"
+            r"\caption{First table}\label{tab:first}\end{table}"
+            r"See \eqref{eq:first}, Figure \ref{fig:first}, "
+            r"subfigure \ref{fig:first-a}, and Table \ref{tab:first}."
+            r"\chapter{Second}"
+            r"\begin{equation}\label{eq:second}y=2\end{equation}"
+            r"\begin{figure}\includegraphics{second.png}"
+            r"\caption{Second figure}\label{fig:second}\end{figure}"
+            r"\begin{table}\begin{tabular}{c}B\end{tabular}"
+            r"\caption{Second table}\label{tab:second}\end{table}"
+            r"See \eqref{eq:second}, Figure \ref{fig:second}, "
+            r"and Table \ref{tab:second}."
+            r"\end{document}",
+            numbering_scope="chapter",
+        )
+
+        assert "Figure 1.1:" in html
+        assert "Figure 2.1:" in html
+        assert "Table 1.1:" in html
+        assert "Table 2.1:" in html
+        assert 'data-reference="eq:first">(1.1)</a>' in html
+        assert 'data-reference="eq:second">(2.1)</a>' in html
+        assert 'data-reference="fig:first">1.1</a>' in html
+        assert 'data-reference="fig:second">2.1</a>' in html
+        assert 'data-reference="tab:first">1.1</a>' in html
+        assert 'data-reference="tab:second">2.1</a>' in html
+        assert 'id="fig:first-a"' in html
+        assert 'data-reference="fig:first-a">1.1a</a>' in html
+
+    def test_numbers_appendix_figures_and_tables(self, tmp_path):
+        html = self.render_html(
+            tmp_path,
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\chapter{Main}"
+            r"\begin{figure}\includegraphics{main.png}"
+            r"\caption{Main figure}\label{fig:main}\end{figure}"
+            r"\begin{table}\begin{tabular}{c}M\end{tabular}"
+            r"\caption{Main table}\label{tab:main}\end{table}"
+            r"\chapter*{A Supplementary Materials}"
+            r"\begin{figure}\includegraphics{appendix.png}"
+            r"\caption{Appendix figure}\label{fig:appendix}\end{figure}"
+            r"\begin{table}\begin{tabular}{c}A\end{tabular}"
+            r"\caption{Appendix table}\label{tab:appendix}\end{table}"
+            r"See Figure \ref{fig:appendix} and Table \ref{tab:appendix}."
+            r"\end{document}",
+            numbering_scope="chapter",
+        )
+
+        assert "Figure 1.1:" in html
+        assert "Table 1.1:" in html
+        assert "Figure A.1:" in html
+        assert "Table A.1:" in html
+        assert 'data-reference="fig:appendix">A.1</a>' in html
+        assert 'data-reference="tab:appendix">A.1</a>' in html
+
+    def test_resolves_preserved_subfigure_labels(self, tmp_path):
+        html = self.render_html(
+            tmp_path,
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\begin{figure}"
+            r"\includegraphics{plot.png}"
+            r"\label{fig:first}\label{fig:second}"
+            r"\caption{Whole figure}\label{fig:whole}"
+            r"\end{figure}"
+            r"See Figure \ref{fig:first}, Figure \ref{fig:second}, "
+            r"and Figure \ref{fig:whole}."
+            r"\end{document}",
+        )
+
+        assert 'id="fig:first"' in html
+        assert 'id="fig:second"' in html
+        assert 'data-reference="fig:first">1a</a>' in html
+        assert 'data-reference="fig:second">1b</a>' in html
+        assert 'data-reference="fig:whole">1</a>' in html
+        assert "[fig:first]" not in html
+        assert "[fig:second]" not in html
+
+    def test_resolves_generated_theorem_ref_numbers(self, tmp_path):
+        tex = tmp_path / "refs.tex"
+        tex.write_text(
+            r"\documentclass{article}"
+            r"\begin{document}"
+            r"\begin{quote}"
+            r"\textbf{Example 1} \textit{(Regression)}\textbf{.}"
+            r"\label{ex:regression}Statement."
+            r"\end{quote}"
+            r"\begin{quote}"
+            r"\textbf{Example 2} \textit{(Classification)}\textbf{.}"
+            r"\label{ex:classification}Statement."
+            r"\end{quote}"
+            r"Examples \ref{ex:regression} and \ref{ex:classification}. "
+            r"See \autoref{ex:regression}."
+            r"\begin{quote}"
+            r"\textbf{Theorem 3}\textbf{.}"
+            r"\label{thm:plain}Statement."
+            r"\end{quote}"
+            r"Theorem \ref{thm:plain}."
+            + p.build_algorithm_output("Test method", "alg:test", [], 4)
+            + r"Algorithm \ref{alg:test}."
+            r"\end{document}"
+        )
+
+        completed = subprocess.run(
+            [
+                "pandoc",
+                str(tex),
+                "--from",
+                "latex",
+                "--to",
+                "plain",
+                f"--lua-filter={p.SCRIPT_DIR / 'filter.lua'}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert "Examples 1 and 2." in completed.stdout
+        assert "See Example 1." in completed.stdout.replace("\N{NO-BREAK SPACE}", " ")
+        assert "Theorem 3." in completed.stdout
+        assert "Algorithm 4." in completed.stdout
+        assert "[ex:" not in completed.stdout
+        assert "[thm:" not in completed.stdout
+        assert "[alg:" not in completed.stdout
+
+
+class TestNumberingScope:
+    def test_uses_chapter_scope_for_numbered_chapters(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "book.tex",
+            r"\documentclass{article}\chapter{One}\chapter*{Notes}",
+        )
+
+        assert p._numbering_scope(source) == "chapter"
+
+    def test_uses_global_scope_without_numbered_chapters(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "article.tex",
+            r"\documentclass{article}\section{One}\chapter*{Notes}",
+        )
+
+        assert p._numbering_scope(source) == "global"
+
+    def test_run_pandoc_passes_detected_scope_to_filter(
+        self, tmp_path, monkeypatch,
+    ):
+        main = tmp_path / "book.tex"
+        main.write_text(
+            r"\documentclass{article}\begin{document}\chapter{One}"
+            r"\begin{subequations}\label{eq:pair}"
+            r"\begin{align}a&=1\label{subeq:a}\end{align}"
+            r"\end{subequations}\end{document}"
+        )
+        captured = {}
+        monkeypatch.setattr(
+            p, "_pandoc_resource_paths", lambda cwd, discovery=None: ["."],
+        )
+        monkeypatch.setattr(
+            p.subprocess,
+            "run",
+            lambda args, **kwargs: captured.update(args=args, kwargs=kwargs),
+        )
+
+        p.run_pandoc(main, tmp_path / "book.epub", None, workdir=tmp_path)
+
+        assert "paper2epub-numbering-scope=chapter" in captured["args"]
+        assert "paper2epub-subequations=eq:pair|subeq:a" in captured["args"]
+
+    def test_collects_parent_and_child_subequation_labels(self, tmp_path):
+        source = p.SourceFile(
+            tmp_path / "book.tex",
+            r"\begin{subequations}"
+            r"\label{eq:pair}"
+            r"\begin{align}"
+            r"a&=1\label{subeq:a}\\b&=2\label{subeq:b}"
+            r"\end{align}"
+            r"\end{subequations}"
+            r"\begin{subequations}"
+            r"\begin{align}c&=3\label{subeq:c}\end{align}"
+            r"\end{subequations}",
+        )
+
+        assert p._subequation_label_groups(source) == (
+            ("eq:pair", "subeq:a", "subeq:b"),
+            ("", "subeq:c"),
+        )
